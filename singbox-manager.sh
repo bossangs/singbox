@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.23.6"
+SCRIPT_VERSION="2026.10.24.1"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -48,7 +48,12 @@ trim_log() {
 }
 svc_restart() {
   need_init
-  if is_openrc; then trim_log; rc-service "$SERVICE" restart; else systemctl restart "$SERVICE"; fi
+  if is_openrc; then trim_log; rc-service "$SERVICE" restart
+  else
+    # 连续多次修改时避免触发 systemd 的启动频率限制（start-limit-hit）
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE"
+  fi
 }
 svc_enable() {
   if is_openrc; then rc-update add "$SERVICE" default >/dev/null 2>&1 || true
@@ -785,8 +790,37 @@ reload_service() {
   svc_restart
 }
 LAST_BACKUP=""
+svc_is_running() {
+  if is_openrc; then rc-service "$SERVICE" status >/dev/null 2>&1
+  else [[ "$(systemctl is-active "$SERVICE" 2>/dev/null)" == active ]]; fi
+}
+port_listening() {
+  # 端口是否由 sing-box 进程在监听（别的程序占着这个端口不算）；$1：端口；$2：tcp / udp / both
+  local n
+  case "${2:-tcp}" in
+    both) port_listening "$1" tcp && port_listening "$1" udp; return ;;
+    udp) n=u ;;
+    *) n=t ;;
+  esac
+  ss -H -ln${n}p "( sport = :$1 )" 2>/dev/null | grep -q '"sing-box"'
+}
+svc_healthy() {
+  # 重启后确认 sing-box 真的在运行（端口被占等原因会让它启动后马上退出）
+  # $1/$2：应该在监听的端口和 tcp / udp / both（可省略）
+  local i
+  sleep 1
+  for i in 1 2 3 4 5 6 7 8; do
+    if svc_is_running && { [[ -z "${1:-}" ]] || port_listening "$1" "${2:-tcp}"; }; then
+      sleep 0.5
+      svc_is_running && return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
 commit_jq() {
   # 用 jq 修改配置：先备份，再校验；校验或重启失败时恢复修改前的配置
+  # EXPECT_PORT / EXPECT_NET：改完后应该在监听的端口，用来确认服务真的起来了
   local tmp="${CONF}.tmp"
   backup_config
   if ! jq "$@" "$CONF" >"$tmp"; then rm -f "$tmp"; die "生成新配置失败，未做任何改动"; fi
@@ -796,11 +830,16 @@ commit_jq() {
     [[ -n "$LAST_BACKUP" ]] && cp -a "$LAST_BACKUP" "$CONF"
     die "sing-box 配置校验失败，已恢复修改前的配置（没有任何改动）"
   fi
-  if ! reload_service; then
+  if ! reload_service || ! svc_healthy "${EXPECT_PORT:-}" "${EXPECT_NET:-}"; then
     [[ -n "$LAST_BACKUP" ]] && cp -a "$LAST_BACKUP" "$CONF"
     svc_restart || true
-    die "sing-box 重启失败，已恢复修改前的配置。查看日志：$(svc_log_hint)"
+    EXPECT_PORT=""; EXPECT_NET=""
+    if svc_healthy; then
+      die "sing-box 用新配置没能正常运行（常见原因：端口被其他程序占用），已恢复修改前的配置，服务已用原配置重新运行。查看日志：$(svc_log_hint)"
+    fi
+    die "sing-box 用新配置没能正常运行，已恢复修改前的配置，但服务仍未运行，请查看日志：$(svc_log_hint)"
   fi
+  EXPECT_PORT=""; EXPECT_NET=""
 }
 RELAY_OUT=""     # 中转：落地出站 JSON（不含 tag）
 RELAY_DESC=""    # 中转：落地说明
@@ -811,6 +850,9 @@ apply_json() {
   # 添加入站；中转时同时添加落地出站和“只匹配这个入站”的路由规则（放在最前面）
   local obj="$1" out="${RELAY_OUT:-null}"
   [[ -n "$out" ]] || out=null
+  EXPECT_PORT="$(jq -r '.listen_port' <<<"$obj")"
+  EXPECT_NET="$(jq -r 'if .type == "hysteria2" or .type == "tuic" then "udp"
+    elif .type == "shadowsocks" or .type == "direct" then (.network // "both") else "tcp" end' <<<"$obj")"
   commit_jq --argjson obj "$obj" --argjson out "$out" --arg to "$RULE_TO" '
     .inbounds += [$obj]
     | .route = (.route // {})
@@ -1458,6 +1500,126 @@ cmd_fp() {
   print_link "$node"
 }
 
+# ---------- 修改节点端口 ----------
+inbound_net() {
+  # 入站使用的传输层：tcp / udp / both
+  jq -r --arg t "$1" '.inbounds[]? | select(.tag == $t) |
+    if .type == "hysteria2" or .type == "tuic" then "udp"
+    elif .type == "shadowsocks" then (.network // "both")
+    elif .type == "direct" then (.network // "both")
+    else "tcp" end' "$CONF"
+}
+net_label() { case "$1" in tcp) echo TCP ;; udp) echo UDP ;; *) echo "TCP 和 UDP" ;; esac; }
+is_local_addr() {
+  # 地址是不是指向本机（中转/转发的目标是本机节点时需要跟着改端口）
+  local a="${1#[}"; a="${a%]}"
+  case "$a" in 127.*|::1|localhost|0.0.0.0|::) return 0 ;; esac
+  [[ "$a" == "$(tr -d "[:space:]" <"$DATA/server-host" 2>/dev/null || true)" ]] && return 0
+  ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$a"
+}
+port_owner() {
+  # 输出配置里占用这个端口的入站名称
+  jq -r --argjson p "$1" '[.inbounds[]? | select(.listen_port == $p) | .tag] | join(", ")' "$CONF"
+}
+cmd_port() {
+  local tag="${1:-}" new="${2:-}" old net owner f kind fwd_tags=() relay_tags=() x is_fwd=0 meta host
+  if [[ -z "$tag" ]]; then
+    list_nodes
+    prompt tag "要修改端口的节点名称（也可以是中转入口或端口转发）" ""
+  fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  old="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .listen_port' "$CONF")"
+  [[ -n "$old" && "$old" != null ]] || die "配置里没有名为 $tag 的节点"
+  meta="$RELAY_DIR/$tag.json"
+  [[ -f "$meta" && "$(jq -r .kind "$meta")" == forward ]] && is_fwd=1
+  (( is_fwd )) || [[ -f "$DATA/$tag.json" ]] || die "找不到 $tag 的凭据文件 $DATA/$tag.json，无法重新生成分享链接"
+  net="$(inbound_net "$tag")"
+  echo "$tag 当前端口：$old（$(net_label "$net")）"
+  if [[ -z "$new" ]]; then
+    case "$net" in both) x="$(free_port $((old + 1)) both)" ;; *) x="$(free_port $((old + 1)) "$net")" ;; esac
+    prompt new "新端口" "$x"
+  fi
+  valid_port "$new" || die "端口必须是 1-65535 的数字"
+  new="$((10#$new))"
+  [[ "$new" != "$old" ]] || { echo "新端口和当前端口相同（$old），没有改动。"; return 0; }
+  owner="$(port_owner "$new")"
+  [[ -z "$owner" ]] || die "端口 $new 已被本脚本的节点 $owner 使用，请换一个端口"
+  case "$net" in
+    tcp) port_free "$new" tcp || die "端口 $new/tcp 已被其他程序占用，请换一个端口（查看：ss -lntp | grep :$new）" ;;
+    udp) port_free "$new" udp || die "端口 $new/udp 已被其他程序占用，请换一个端口（查看：ss -lnup | grep :$new）" ;;
+    both) port_free "$new" tcp || die "端口 $new/tcp 已被其他程序占用，请换一个端口（查看：ss -lntp | grep :$new）"
+          port_free "$new" udp || die "端口 $new/udp 已被其他程序占用，请换一个端口（查看：ss -lnup | grep :$new）" ;;
+  esac
+
+  # 本机上指向这个节点旧端口的端口转发 / 中转落地，跟着一起改
+  shopt -s nullglob
+  for f in "$RELAY_DIR"/*.json; do
+    [[ "$(jq -r .tag "$f")" == "$tag" ]] && continue
+    kind="$(jq -r .kind "$f")"
+    if [[ "$kind" == forward ]] && [[ "$(jq -r .target_port "$f")" == "$old" ]] && is_local_addr "$(jq -r .target "$f")"; then
+      fwd_tags+=("$(jq -r .tag "$f")")
+    elif [[ "$kind" == relay ]] && [[ "$(jq -r .landing.port "$f")" == "$old" ]] && is_local_addr "$(jq -r .landing.server "$f")"; then
+      relay_tags+=("$(jq -r .tag "$f")")
+    fi
+  done
+  shopt -u nullglob
+  local fj rj
+  fj="$(printf '%s\n' "${fwd_tags[@]}" | jq -R . | jq -sc 'map(select(. != ""))')"
+  rj="$(printf '%s\n' "${relay_tags[@]}" | jq -R . | jq -sc 'map(select(. != "")) | map("to-" + .)')"
+
+  EXPECT_PORT="$new"; EXPECT_NET="$net"
+  commit_jq --arg t "$tag" --argjson new "$new" --argjson fw "$fj" --argjson ro "$rj" '
+    .inbounds |= map(
+      if .tag == $t then .listen_port = $new
+      elif (.tag as $x | $fw | index($x)) != null then .override_port = $new
+      else . end)
+    | if (.outbounds | type) == "array" then
+        .outbounds |= map(if (.tag as $x | $ro | index($x)) != null then .server_port = $new else . end)
+      else . end'
+
+  host="$(public_host)"
+  if [[ -f "$DATA/$tag.json" ]]; then
+    jq --argjson p "$new" --arg h "$host" '.port = $p | .server = $h' "$DATA/$tag.json" >"$DATA/$tag.json.tmp" &&
+      install -m 600 "$DATA/$tag.json.tmp" "$DATA/$tag.json"
+    rm -f "$DATA/$tag.json.tmp"
+  fi
+  if [[ -f "$meta" ]]; then
+    jq --argjson p "$new" '.listen_port = $p' "$meta" >"$meta.tmp" && install -m 600 "$meta.tmp" "$meta"
+    rm -f "$meta.tmp"
+  fi
+  for x in "${fwd_tags[@]}"; do
+    f="$RELAY_DIR/$x.json"
+    jq --argjson p "$new" '.target_port = $p' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"; rm -f "$f.tmp"
+  done
+  for x in "${relay_tags[@]}"; do
+    f="$RELAY_DIR/$x.json"
+    jq --argjson p "$new" --arg o ":$old" --arg n ":$new" '.landing.port = $p | .landing_desc |= sub($o + "$"; $n)' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"; rm -f "$f.tmp"
+  done
+
+  echo
+  echo "已把 $tag 的端口从 $old 改为 $new：配置已校验，sing-box 已重启。"
+  if (( is_fwd )); then
+    echo "UUID、密码等都没变（端口转发只改了本机监听端口）。"
+    print_forward_link "$meta" "$host"
+  else
+    echo "UUID、密钥、密码和指纹都没变，只是端口变了。"
+    print_link "$DATA/$tag.json"
+    echo "已在用的客户端：重新导入上面的链接，或者在客户端里把端口改成 $new。"
+  fi
+  for x in "${fwd_tags[@]}"; do echo "本机端口转发 $x 原来指向这个节点的端口 $old，已同步改为 $new。"; done
+  for x in "${relay_tags[@]}"; do echo "本机中转 $x 的落地原来是这个节点的端口 $old，已同步改为 $new。"; done
+  echo
+  echo "防火墙：请放行新端口 ${new}（$(net_label "$net")），旧端口 $old 不再使用，可以关闭。"
+  case "$net" in
+    tcp) echo "  UFW 示例：ufw allow ${new}/tcp" ;;
+    udp) echo "  UFW 示例：ufw allow ${new}/udp" ;;
+    both) echo "  UFW 示例：ufw allow ${new}/tcp; ufw allow ${new}/udp" ;;
+  esac
+  echo "  云服务商后台的安全组 / 防火墙也要放行。"
+  echo "如果其他服务器上有中转或端口转发把这个节点当作落地（本机无法知道），要在那台机器上改成新端口：删除后用新链接重新添加中转。"
+}
+
 # ---------- 管理 ----------
 list_nodes() {
   echo "已配置的入站节点："
@@ -1544,6 +1706,7 @@ singbox-manager ${SCRIPT_VERSION}
   relay forward    添加端口转发（TCP/UDP → 目标地址:端口）
   relay list       查看中转/转发和分享链接
   relay del [名称] 删除中转/转发
+  port [名称] [新端口]  修改节点端口（UUID、密钥、密码、指纹都不变）
   fp [名称] [指纹] 修改节点的 TLS 指纹（可多个，如 chrome,firefox 或 all），每个指纹一条分享链接
   check            校验 sing-box 配置
   status           查看版本、服务状态和监听端口
@@ -1577,8 +1740,9 @@ menu() {
     echo "15) 更新脚本"
     echo "16) 中转 / 端口转发"
     echo "17) 修改节点 TLS 指纹（多指纹分享链接）"
+    echo "18) 修改节点端口"
     echo "0) 退出"
-    read -r -p "选择 [0-17]: " choice || exit 0
+    read -r -p "选择 [0-18]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -1597,6 +1761,7 @@ menu() {
       15) cmd_update; echo "请重新运行 sb 以使用新版本。"; exit 0 ;;
       16) relay_menu ;;
       17) cmd_fp ;;
+      18) cmd_port ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1655,6 +1820,7 @@ main() {
         *) usage; exit 2 ;;
       esac ;;
     fp|fingerprint) need_jq; cmd_fp "${2:-}" "${*:3}" ;;
+    port) prepare_manage; cmd_port "${2:-}" "${3:-}" ;;
     links) need_jq; show_links ;;
     host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
