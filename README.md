@@ -51,10 +51,10 @@ sb
 
 | 菜单 | 协议 | 传输 | 默认端口 | 说明 |
 | --- | --- | --- | --- | --- |
-| 1 | VLESS + Reality | TCP | 443 | flow 为 `xtls-rprx-vision`，默认握手域名 `www.cloudflare.com`，自动生成 Reality 密钥对和 short_id |
+| 1 | VLESS + Reality | TCP | 443 | flow 为 `xtls-rprx-vision`，默认握手域名 `www.cloudflare.com`，自动生成 Reality 密钥对和 short_id；可选多个 TLS 指纹 |
 | 2 | Hysteria2 | UDP | 8443 | 使用自签证书 |
 | 3 | TUIC | UDP | 9443 | 拥塞控制 `bbr`，ALPN `h3`，使用自签证书 |
-| 4 | AnyTLS | TCP | 10443 | 使用自签证书 |
+| 4 | AnyTLS | TCP | 10443 | 使用自签证书；可选多个 TLS 指纹 |
 | 5 | Shadowsocks | TCP | 11443 | 支持 `aes-128-gcm`（默认）、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm` |
 
 UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里没有写死任何密码。
@@ -79,6 +79,7 @@ UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里�
 14) 修改服务器地址（重新生成分享链接）
 15) 更新脚本
 16) 中转 / 端口转发
+17) 修改节点 TLS 指纹（多指纹分享链接）
 0) 退出
 ```
 
@@ -86,6 +87,7 @@ UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里�
 
 - 选择协议（1-5），输入节点名称（只能用字母、数字、下划线、短横线，最长 40 个字符）和端口。脚本会检查端口是否已被占用。
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
+- Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
 - Reality 需要填写 SNI / 握手域名；Hysteria2、TUIC、AnyTLS 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址）；Shadowsocks 需要选择加密方式。
 - 脚本先备份当前配置，再写入新节点并用 `sing-box check` 校验。校验失败会自动恢复最近一次备份；通过则重启服务。
 - 屏幕上会显示节点参数和分享链接，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 7 或 `sb links` 再看。
@@ -105,6 +107,50 @@ sb host
 ```
 
 IPv6 地址会自动在链接里加上方括号，例如 `vless://...@[2001:db8::1]:443`。
+
+## TLS 指纹（多指纹分享链接）
+
+VLESS + Reality 和 AnyTLS 节点可以设置一个或多个客户端 TLS 指纹（uTLS `fp`），每个指纹生成一条分享链接，名称是 `节点名-指纹`，例如 `reality-1-chrome`、`reality-1-firefox`。只选一个指纹时，链接名称就是节点名本身。
+
+可选的指纹：`chrome`、`firefox`、`safari`、`ios`、`android`、`edge`、`360`、`qq`、`random`、`randomized`（每次连接随机）。
+
+- **Reality 不支持 `android` 和 `360`**：这两个指纹没有 Reality 需要的 TLS 1.3 X25519 密钥交换，客户端会连不上（sing-box 报 `nil ecdheKey`）。选了也会被自动跳过，`all` 对 Reality 是可用的 8 种。
+- **AnyTLS** 10 种都可以用。
+- **Hysteria2、TUIC、Shadowsocks** 不使用 uTLS 指纹（前两个走 QUIC，Shadowsocks 没有 TLS），无需设置。
+
+添加节点时会直接让你选。已有的节点随时可以修改，**只改分享链接，UUID、密钥、端口和服务端配置都不变**，正在使用的客户端不受影响。
+
+查看所有节点的指纹并选择要修改的节点：
+
+```bash
+sb fp
+```
+
+打开某个节点的指纹菜单（添加 / 删除 / 重新选择）：
+
+```bash
+sb fp reality-1
+```
+
+直接把一个节点设成几个指纹（覆盖原来的列表）：
+
+```bash
+sb fp reality-1 chrome,firefox,safari,ios
+```
+
+一个节点输出所有可用指纹的链接：
+
+```bash
+sb fp reality-1 all
+```
+
+改完后查看每个指纹的分享链接：
+
+```bash
+sb links
+```
+
+老节点没有设置过指纹时：Reality 链接按 `chrome` 显示（和以前一样），AnyTLS 链接不带 `fp`。
 
 ## 中转和端口转发
 
@@ -187,6 +233,8 @@ sb relay del
 | `sb relay forward` | 添加端口转发（TCP/UDP → 目标地址:端口） |
 | `sb relay list` | 查看中转/转发和分享链接 |
 | `sb relay del 名称` | 删除中转/转发 |
+| `sb fp` | 查看并修改节点的 TLS 指纹 |
+| `sb fp 名称 chrome,firefox` | 把节点设为这几个指纹，每个指纹一条分享链接（`all` 表示全部可用指纹） |
 | `sb check` | 校验 sing-box 配置 |
 | `sb status` | 查看 sing-box 版本、服务状态和监听端口 |
 | `sb restart` | 重启 sing-box |

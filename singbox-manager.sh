@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.23.5"
+SCRIPT_VERSION="2026.10.23.6"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -866,8 +866,13 @@ print_link() {
   h="$(uri_host "$(jq -r '.server' "$f")")"
   case "$proto" in
     "VLESS + Reality")
-      echo "分享链接（标准 VLESS Reality URI）："
-      jq -r --arg h "$h" '"vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=chrome&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag)"' "$f" ;;
+      if (( $(jq '(.fps // [.fp // "chrome"]) | length' "$f") > 1 )); then
+        echo "分享链接（标准 VLESS Reality URI，每个指纹一条）："
+      else
+        echo "分享链接（标准 VLESS Reality URI）："
+      fi
+      jq -r --arg h "$h" '(.fps // [.fp // "chrome"]) as $fps | $fps[] as $fp
+        | "vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=\($fp)&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
     Hysteria2)
       echo "分享链接（自签证书，客户端需允许不安全证书）："
       jq -r --arg h "$h" '"hysteria2://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
@@ -876,7 +881,8 @@ print_link() {
       jq -r --arg h "$h" '"tuic://\(.uuid):\(.password)@\($h):\(.port)?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
     AnyTLS)
       echo "分享链接（不同客户端 URI 参数可能不同，请核对客户端文档）："
-      jq -r --arg h "$h" '"anytls://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
+      jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
+        | "anytls://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
     Shadowsocks)
       userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 -w0)"
       echo "分享链接："
@@ -893,6 +899,63 @@ save_node() {
   jq . "$f"
   print_link "$f"
 }
+
+# ---------- TLS 指纹（uTLS） ----------
+# sing-box 1.14 支持的 uTLS 指纹；只有 VLESS Reality、AnyTLS 这类 TCP 上的 TLS 协议用得上
+FP_LIST=(chrome firefox safari ios android edge 360 qq random randomized)
+valid_fp() { local x; for x in "${FP_LIST[@]}"; do [[ "$1" == "$x" ]] && return 0; done; return 1; }
+# Reality 需要 TLS 1.3 的 X25519 密钥交换；android、360 指纹没有，客户端会报 nil ecdheKey
+REALITY_BAD_FP="android 360"
+parse_fps() {
+  # 把“1,3”“chrome firefox”“all/全部”转换成去重后的指纹列表（空格分隔）；无效时返回 1
+  # $2=reality 时去掉 Reality 用不了的指纹
+  local in="$1" mode="${2:-}" t res=() x seen skipped=""
+  in="${in//，/ }"; in="${in//、/ }"; in="${in//,/ }"; in="${in//;/ }"; in="${in,,}"
+  for t in $in; do
+    case "$t" in
+      all|全部|a) res=("${FP_LIST[@]}"); break ;;
+    esac
+    if valid_fp "$t"; then :
+    elif [[ "$t" =~ ^[0-9]+$ ]] && (( 10#$t >= 1 && 10#$t <= ${#FP_LIST[@]} )); then t="${FP_LIST[$((10#$t - 1))]}"
+    else echo "不认识的指纹：$t（可选：${FP_LIST[*]}，或 all）" >&2; return 1; fi
+    seen=0; for x in "${res[@]}"; do [[ "$x" == "$t" ]] && seen=1; done
+    (( seen )) || res+=("$t")
+  done
+  if [[ "$mode" == reality ]]; then
+    local keep=()
+    for x in "${res[@]}"; do
+      if [[ " $REALITY_BAD_FP " == *" $x "* ]]; then skipped+="$x "; else keep+=("$x"); fi
+    done
+    res=("${keep[@]}")
+    [[ -z "$skipped" || "$in" == *all* || "$in" == *全部* ]] ||
+      echo "提示：Reality 不支持 ${skipped% } 指纹（缺少 TLS 1.3 的 X25519 密钥交换，客户端会连不上），已跳过。" >&2
+  fi
+  ((${#res[@]})) || return 1
+  printf '%s' "${res[*]}"
+}
+show_fp_choices() {
+  # $1=reality 时说明 android、360 不可用
+  echo "  1) chrome   2) firefox   3) safari   4) ios    5) android"
+  echo "  6) edge     7) 360       8) qq       9) random 10) randomized（每次连接随机）"
+  if [[ "${1:-}" == reality ]]; then
+    echo "  all) 全部可用的 8 种（Reality 不支持 android 和 360，会自动跳过）"
+  else
+    echo "  all) 全部 10 种"
+  fi
+  echo "可以选多个，用逗号或空格分开，例如 1,2,4 或 chrome firefox。每个指纹生成一条分享链接。"
+}
+choose_fps() {
+  # $1：变量名（结果为空格分隔的指纹列表）；$2：默认值；$3=reality 时排除 Reality 用不了的指纹
+  local __v __r __def="${2:-chrome}"
+  echo "客户端 TLS 指纹（uTLS fp）："
+  show_fp_choices "${3:-}"
+  read -r -p "选择 [默认 $__def]: " __v || __v=""
+  [[ -n "${__v//[[:space:]]/}" ]] || __v="$__def"
+  __r="$(parse_fps "$__v" "${3:-}")" || die "指纹选择无效"
+  printf -v "$1" '%s' "$__r"
+  echo "已选择指纹：$__r"
+}
+fps_json() { jq -nc --arg s "$1" '$s | split(" ") | map(select(. != ""))'; }
 
 # ---------- 端口 ----------
 port_in_config() { jq -e --argjson p "$1" '[.inbounds[]? | select(.listen_port == $p)] | length > 0' "$CONF" >/dev/null 2>&1; }
@@ -919,11 +982,12 @@ free_port() {
 
 # ---------- 添加节点 ----------
 add_reality() {
-  local tag port sni uuid keys priv pub sid obj host
+  local tag port sni uuid keys priv pub sid obj host fps
   ask_tag tag reality
   prompt port "TCP 端口" "$(free_port 443 tcp)"
   check_port "$port" tcp
   prompt sni "Reality SNI/握手域名" "www.cloudflare.com"
+  choose_fps fps chrome reality
   host="$(public_host)"
   uuid="$(new_uuid)"
   keys="$("$SB" generate reality-keypair)"
@@ -934,8 +998,8 @@ add_reality() {
   obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" \
     '{type:"vless",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$sni,reality:{enabled:true,handshake:{server:$sni,server_port:443},private_key:$priv,short_id:[$sid]}}}')"
   apply_json "$obj"
-  save_node "$tag" "$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg host "$host" --argjson port "$port" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" \
-    '{protocol:"VLESS + Reality",tag:$tag,server:$host,port:$port,uuid:$uuid,flow:"xtls-rprx-vision",security:"reality",sni:$sni,public_key:$pub,short_id:$sid}')"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg host "$host" --argjson port "$port" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" --argjson fps "$(fps_json "$fps")" \
+    '{protocol:"VLESS + Reality",tag:$tag,server:$host,port:$port,uuid:$uuid,flow:"xtls-rprx-vision",security:"reality",sni:$sni,public_key:$pub,short_id:$sid,fps:$fps}')"
 }
 add_hy2() {
   local tag port password obj host
@@ -967,18 +1031,19 @@ add_tuic() {
     '{protocol:"TUIC",tag:$tag,server:$host,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:true}')"
 }
 add_anytls() {
-  local tag port password obj host
+  local tag port password obj host fps
   ask_tag tag anytls
   prompt port "TCP 端口" "$(free_port 10443 tcp)"
   check_port "$port" tcp
   host="$(public_host)"
   ask_tls_host "$host"
+  choose_fps fps chrome
   password="$(openssl rand -hex 24)"
   obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg password "$password" \
     '{type:"anytls",tag:$tag,listen:"::",listen_port:$port,users:[{name:"user",password:$password}],tls:{enabled:true,certificate_path:"/etc/sing-box/certs/server.crt",key_path:"/etc/sing-box/certs/server.key"}}')"
   apply_json "$obj"
-  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" \
-    '{protocol:"AnyTLS",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:true}')"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" --argjson fps "$(fps_json "$fps")" \
+    '{protocol:"AnyTLS",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:true,fps:$fps}')"
 }
 add_ss() {
   local tag port password method obj host
@@ -1313,6 +1378,86 @@ relay_menu() {
   esac
 }
 
+# ---------- 修改节点指纹 ----------
+node_fps() {
+  # 输出节点当前的指纹列表（空格分隔）；AnyTLS 老节点没有 fp 时输出空
+  jq -r 'if .fps then (.fps | join(" ")) elif .fp then .fp
+         elif .protocol == "VLESS + Reality" then "chrome" else "" end' "$1"
+}
+fp_overview() {
+  local f proto cur
+  shopt -s nullglob
+  local files=("$DATA"/*.json)
+  shopt -u nullglob
+  ((${#files[@]})) || { echo "还没有节点。"; return 0; }
+  printf '%-24s %-18s %s\n' "名称" "协议" "指纹"
+  for f in "${files[@]}"; do
+    proto="$(jq -r .protocol "$f")"
+    case "$proto" in
+      "VLESS + Reality"|AnyTLS) cur="$(node_fps "$f")"; cur="${cur:-（未设置，链接不带 fp）}" ;;
+      *) cur="-（不使用 uTLS）" ;;
+    esac
+    printf '%-24s %-18s %s\n' "$(jq -r .tag "$f")" "${proto// /}" "$cur"
+  done
+}
+cmd_fp() {
+  # 修改节点分享链接里的指纹；只改链接，不动 UUID、密钥、端口和 sing-box 配置
+  local tag="${1:-}" arg="${2:-}" node proto cur new c tmp x keep
+  if [[ -z "$tag" ]]; then
+    fp_overview
+    echo
+    prompt tag "要修改指纹的节点名称" ""
+  fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  node="$DATA/$tag.json"
+  if [[ ! -f "$node" ]]; then
+    [[ -f "$RELAY_DIR/$tag.json" ]] && die "$tag 是端口转发：流量原样转发、不解密，指纹由客户端决定，请在客户端里修改。"
+    die "没有名为 $tag 的节点"
+  fi
+  proto="$(jq -r .protocol "$node")"
+  case "$proto" in
+    "VLESS + Reality"|AnyTLS) ;;
+    *) echo "$tag 是 ${proto}：Hysteria2、TUIC 走 QUIC，Shadowsocks 没有 TLS，都不使用 uTLS 指纹，无需设置。"; return 0 ;;
+  esac
+  cur="$(node_fps "$node")"
+  local mode=""
+  [[ "$proto" == "VLESS + Reality" ]] && mode=reality
+  if [[ -n "$arg" ]]; then
+    new="$(parse_fps "$arg" "$mode")" || die "指纹选择无效"
+  else
+    echo "节点 $tag（$proto）当前指纹：${cur:-未设置}"
+    echo "1) 添加指纹   2) 删除指纹   3) 重新选择全部指纹"
+    read -r -p "选择 [1-3，默认 1]: " c || c=1
+    case "${c:-1}" in
+      1) echo "要添加的指纹："; show_fp_choices "$mode"
+         read -r -p "添加: " x || x=""
+         x="$(parse_fps "$x" "$mode")" || die "指纹选择无效"
+         new="$(parse_fps "$cur $x" "$mode" 2>/dev/null)" ;;
+      2) [[ -n "$cur" ]] || die "这个节点还没有设置指纹"
+         read -r -p "要删除的指纹（当前：$cur）: " x || x=""
+         x="$(parse_fps "$x")" || die "指纹选择无效"
+         keep=""
+         for c in $cur; do [[ " $x " == *" $c "* ]] || keep+="$c "; done
+         [[ -n "${keep// /}" ]] || die "至少要保留一个指纹"
+         new="$(parse_fps "$keep")" ;;
+      3) choose_fps new "${cur// /,}" "$mode" ;;
+      *) die "无效选项" ;;
+    esac
+  fi
+  tmp="$node.tmp"
+  jq --argjson fps "$(fps_json "$new")" --arg h "$(public_host)" '.server = $h | del(.fp) | .fps = $fps' "$node" >"$tmp" && install -m 600 "$tmp" "$node"
+  rm -f "$tmp"
+  if [[ "$new" == "$cur" ]]; then
+    echo "指纹没有变化：$new"
+  else
+    echo "已把 $tag 的指纹改为：$new"
+    echo "只改了分享链接，UUID、密钥、端口和服务端配置都没变，已经在用的客户端不受影响。"
+  fi
+  echo
+  print_link "$node"
+}
+
 # ---------- 管理 ----------
 list_nodes() {
   echo "已配置的入站节点："
@@ -1399,6 +1544,7 @@ singbox-manager ${SCRIPT_VERSION}
   relay forward    添加端口转发（TCP/UDP → 目标地址:端口）
   relay list       查看中转/转发和分享链接
   relay del [名称] 删除中转/转发
+  fp [名称] [指纹] 修改节点的 TLS 指纹（可多个，如 chrome,firefox 或 all），每个指纹一条分享链接
   check            校验 sing-box 配置
   status           查看版本、服务状态和监听端口
   restart          重启 sing-box
@@ -1430,8 +1576,9 @@ menu() {
     echo "14) 修改服务器地址（重新生成分享链接）"
     echo "15) 更新脚本"
     echo "16) 中转 / 端口转发"
+    echo "17) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "0) 退出"
-    read -r -p "选择 [0-16]: " choice || exit 0
+    read -r -p "选择 [0-17]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -1449,6 +1596,7 @@ menu() {
       14) cmd_set_host; compgen -G "$RELAY_DIR/*.json" >/dev/null && relay_list ;;
       15) cmd_update; echo "请重新运行 sb 以使用新版本。"; exit 0 ;;
       16) relay_menu ;;
+      17) cmd_fp ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1506,6 +1654,7 @@ main() {
         del|rm|remove) relay_remove "${3:-}" ;;
         *) usage; exit 2 ;;
       esac ;;
+    fp|fingerprint) need_jq; cmd_fp "${2:-}" "${*:3}" ;;
     links) need_jq; show_links ;;
     host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
