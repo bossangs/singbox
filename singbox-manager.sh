@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.23.4"
+SCRIPT_VERSION="2026.10.23.5"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -562,25 +562,102 @@ latest_sb_version() {
   # 通过 releases/latest 的跳转读取版本号，不占用 GitHub API 次数
   curl -fsSI --max-time 15 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/v##p' | head -n1
 }
+sb_release_arch() {
+  # uname -m -> sing-box 发布包里的架构名
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    i386|i486|i586|i686|x86) echo 386 ;;
+    armv7*|armhf) echo armv7 ;;
+    armv6*) echo armv6 ;;
+    armv5*) echo armv5 ;;
+    riscv64) echo riscv64 ;;
+    loongarch64|loong64) echo loong64 ;;
+    s390x) echo s390x ;;
+    ppc64le) echo ppc64le ;;
+    *) return 1 ;;
+  esac
+}
+sb_works() {
+  # 确认这个文件真的能在本机运行（例如 musl / glibc 是否匹配）
+  [[ -f "$1" ]] && chmod 755 "$1" && "$1" version >/dev/null 2>&1
+}
+install_sb_tarball() {
+  # 下载官方发布的压缩包，取出 sing-box 程序装到 /usr/bin/sing-box
+  # $1 版本号；$2 起依次尝试的包名后缀（如 -musl、空）
+  local v="$1" arch suffix name url tmp bin
+  shift
+  arch="$(sb_release_arch)" || { echo "  不认识的 CPU 架构：$(uname -m)，跳过官方压缩包。"; return 1; }
+  [[ -n "$v" ]] || { echo "  没有读到 sing-box 最新版本号，跳过官方压缩包。"; return 1; }
+  tmp="$(mktemp -d)"
+  for suffix in "$@"; do
+    name="sing-box-${v}-linux-${arch}${suffix}"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${v}/${name}.tar.gz"
+    echo "  下载 $url"
+    rm -rf "${tmp:?}"/*
+    if ! curl -fL --retry 2 --connect-timeout 15 --max-time 300 -o "$tmp/sb.tar.gz" "$url"; then
+      echo "  下载失败：${name}.tar.gz"
+      continue
+    fi
+    if ! tar -xzf "$tmp/sb.tar.gz" -C "$tmp"; then
+      echo "  解压失败：${name}.tar.gz"
+      continue
+    fi
+    bin="$(find "$tmp" -type f -name sing-box | head -n1)"
+    if [[ -z "$bin" ]] || ! sb_works "$bin"; then
+      echo "  ${name} 里的程序无法在本机运行，换下一个。"
+      continue
+    fi
+    install -m 755 "$bin" /usr/bin/sing-box
+    rm -rf "$tmp"
+    echo "  已安装 /usr/bin/sing-box（来自官方发布包 ${name}.tar.gz）"
+    return 0
+  done
+  rm -rf "$tmp"
+  return 1
+}
+install_sb_official_script() {
+  # 官方安装脚本出错时也可能返回 0，所以只看装完后程序能不能用
+  local v="$1"
+  curl -fsSL --max-time 60 https://sing-box.app/install.sh -o /tmp/sing-box-install.sh || { echo "  下载官方安装脚本失败。"; return 1; }
+  if [[ -n "$v" ]]; then
+    bash /tmp/sing-box-install.sh --version "$v" || true
+  else
+    bash /tmp/sing-box-install.sh || true
+  fi
+  rm -f /tmp/sing-box-install.sh
+  resolve_sb
+}
 install_singbox() {
-  if ! resolve_sb; then
-    echo "正在通过 sing-box 官方安装脚本安装内核……"
-    local v ok=0
+  local v
+  if resolve_sb; then
+    echo "已检测到 sing-box 程序：$SB"
+  else
     v="$(latest_sb_version || true)"
-    if curl -fsSL https://sing-box.app/install.sh -o /tmp/sing-box-install.sh; then
-      if [[ "$v" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
-        bash /tmp/sing-box-install.sh --version "$v" && ok=1
+    [[ "$v" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || v=""
+    echo "正在安装 sing-box 内核${v:+ $v}……"
+    if have apk && ! have apt-get; then
+      # Alpine：官方 apk 包在较老的 Alpine（如 3.21）上可能装不上，优先用官方静态压缩包
+      echo "[1/3] 官方发布的压缩包（musl 版优先）"
+      if install_sb_tarball "$v" -musl "" && resolve_sb; then :
       else
-        bash /tmp/sing-box-install.sh && ok=1
+        echo "[2/3] 官方压缩包没有装成，改用官方安装脚本（apk 包）"
+        if install_sb_official_script "$v"; then :
+        else
+          echo "[3/3] 官方 apk 包也没有装成，改用 Alpine 软件源里的 sing-box（版本可能较旧）"
+          { apk add sing-box sing-box-openrc || apk add sing-box; } || echo "  Alpine 软件源安装也失败了（Alpine 3.21 及更早版本的软件源里没有 sing-box）。"
+        fi
+      fi
+    else
+      echo "[1/2] 官方安装脚本"
+      if install_sb_official_script "$v"; then :
+      else
+        echo "[2/2] 官方安装脚本没有装成，改用官方发布的压缩包"
+        install_sb_tarball "$v" "" || true
       fi
     fi
-    rm -f /tmp/sing-box-install.sh
-    if (( ! ok )) && have apk; then
-      echo "官方安装没有成功，改用 Alpine 软件源里的 sing-box。"
-      apk add sing-box sing-box-openrc || apk add sing-box
-    fi
+    resolve_sb || die "sing-box 安装失败：上面几种方式都没有成功。请检查服务器能否访问 github.com，或手动把官方发布包里的 sing-box 放到 /usr/bin/sing-box 后重新运行 install"
   fi
-  resolve_sb || die "未找到 sing-box 程序，请检查官方安装是否成功"
   "$SB" version
 }
 write_clean_config() {
