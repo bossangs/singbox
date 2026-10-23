@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.23"
+SCRIPT_VERSION="2026.10.23.2"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -203,100 +203,222 @@ cmd_set_host() {
 }
 
 # ---------- 其他 sing-box 脚本检测 ----------
-CONFLICTS=()
+CONFLICTS=()          # 其他脚本仍在使用的痕迹：停下，给出指引
+FOREIGN_RM=()         # 指引里需要删除的具体路径（保留本脚本格式配置时使用）
+LEFTOVERS=()          # 旧脚本删掉后留下的残留说明
+LEFTOVER_FILES=()     # 可自动备份并删除的残留文件/失效链接
+LEFTOVER_DIRS=()      # 可自动删除的空目录
+LEFTOVER_ALIAS=0      # /root/.bashrc 里旧脚本的 alias
+LEFTOVER_UNIT=0       # 删除了 systemd 服务文件，需要 daemon-reload
+CLEANED_ALIAS=0
 OTHER_NAME="另一个 sing-box 一键脚本"
 OTHER_CADDY=0
+OLD_ALIAS_RE='^alias (sb|sing-box)=/usr/local/bin/sing-box$'
+is_dangling() { [[ -L "$1" && ! -e "$1" ]]; }
+dir_has_files() { [[ -d "$1" ]] && [[ -n "$(find "$1" -mindepth 1 -print -quit 2>/dev/null)" ]]; }
+conf_is_ours() { [[ -f "$CONF" ]] && jq -e '.inbounds | type == "array"' "$CONF" >/dev/null 2>&1; }
+pkg_owns() {
+  # Debian 13 是 usr 合并布局：/lib 就是 /usr/lib，dpkg 里两种路径都可能出现
+  local c
+  have dpkg || return 1
+  for c in "$1" "$(readlink -f "$1" 2>/dev/null || true)" "/usr${1#/usr}" "${1#/usr}"; do
+    [[ -n "$c" ]] && dpkg -S "$c" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 detect_conflicts() {
-  CONFLICTS=()
+  CONFLICTS=(); FOREIGN_RM=(); LEFTOVERS=(); LEFTOVER_FILES=(); LEFTOVER_DIRS=(); LEFTOVER_ALIAS=0
   OTHER_NAME="另一个 sing-box 一键脚本"
   OTHER_CADDY=0
-  local f real p ver exec_line
+  local f d real p ver exec_line exec_bin unit
 
   if [[ -f "$CONF_DIR/sh/sing-box.sh" ]]; then
     ver="$(grep -m1 '^is_sh_ver=' "$CONF_DIR/sh/sing-box.sh" 2>/dev/null | cut -d= -f2 || true)"
     OTHER_NAME="233boy sing-box 脚本${ver:+ $ver}"
   fi
-  [[ -d "$CONF_DIR/sh" ]]   && CONFLICTS+=("$CONF_DIR/sh/ —— 其他脚本的管理程序目录")
-  [[ -d "$CONF_DIR/bin" ]]  && CONFLICTS+=("$CONF_DIR/bin/ —— 其他脚本自带的 sing-box 程序")
-  [[ -d "$CONF_DIR/conf" ]] && CONFLICTS+=("$CONF_DIR/conf/ —— 其他脚本的节点配置目录")
+  for d in sh bin conf; do
+    if dir_has_files "$CONF_DIR/$d"; then
+      case "$d" in
+        sh) CONFLICTS+=("$CONF_DIR/sh/ —— 其他脚本的管理程序目录") ;;
+        bin) CONFLICTS+=("$CONF_DIR/bin/ —— 其他脚本自带的 sing-box 程序") ;;
+        conf) CONFLICTS+=("$CONF_DIR/conf/ —— 其他脚本的节点配置目录") ;;
+      esac
+      FOREIGN_RM+=("$CONF_DIR/$d")
+    elif [[ -d "$CONF_DIR/$d" ]]; then
+      LEFTOVERS+=("$CONF_DIR/$d/ —— 旧脚本留下的空目录")
+      LEFTOVER_DIRS+=("$CONF_DIR/$d")
+    fi
+  done
 
-  if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] && ! shortcut_is_ours; then
-    real="$(readlink -f "$SHORTCUT" 2>/dev/null || echo "$SHORTCUT")"
-    [[ "$real" == "$CONF_DIR"/* ]] && CONFLICTS+=("$SHORTCUT —— 是其他 sing-box 脚本的管理命令（指向 $real）")
-  fi
-  if [[ -e /usr/local/bin/sing-box || -L /usr/local/bin/sing-box ]]; then
-    real="$(readlink -f /usr/local/bin/sing-box 2>/dev/null || echo /usr/local/bin/sing-box)"
-    is_elf "$real" || CONFLICTS+=("/usr/local/bin/sing-box —— 是其他脚本的管理命令（指向 $real），不是 sing-box 程序")
-  fi
-  p="$(command -v sing-box 2>/dev/null || true)"
-  if [[ -n "$p" && "$p" != /usr/local/bin/sing-box ]]; then
+  # 快捷命令和 sing-box 命令
+  for p in /usr/local/bin/sing-box "$SHORTCUT"; do
+    if is_dangling "$p"; then
+      LEFTOVERS+=("$p —— 失效的链接（指向已不存在的 $(readlink "$p" 2>/dev/null || echo '?')）")
+      LEFTOVER_FILES+=("$p")
+      continue
+    fi
+    [[ -e "$p" ]] || continue
     real="$(readlink -f "$p" 2>/dev/null || echo "$p")"
-    is_elf "$real" || CONFLICTS+=("sing-box 命令（$p）指向脚本 $real，不是 sing-box 程序")
+    if [[ "$p" == "$SHORTCUT" ]]; then
+      if ! shortcut_is_ours && [[ "$real" == "$CONF_DIR"/* ]]; then
+        CONFLICTS+=("$p —— 是其他 sing-box 脚本的管理命令（指向 $real）")
+        FOREIGN_RM+=("$p")
+      fi
+    elif ! is_elf "$real"; then
+      CONFLICTS+=("$p —— 是其他脚本的管理命令（指向 $real），不是 sing-box 程序")
+      FOREIGN_RM+=("$p")
+    fi
+  done
+  p="$(command -v sing-box 2>/dev/null || true)"
+  if [[ -n "$p" && "$p" != /usr/local/bin/sing-box && -e "$p" ]]; then
+    real="$(readlink -f "$p" 2>/dev/null || echo "$p")"
+    is_elf "$real" || { CONFLICTS+=("sing-box 命令（$p）指向脚本 $real，不是 sing-box 程序"); FOREIGN_RM+=("$p"); }
   fi
 
+  # systemd 服务
   if have systemctl && systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
     exec_line="$(systemctl cat "${SERVICE}.service" 2>/dev/null | sed -n 's/^ExecStart=//p' | sed '/^[[:space:]]*$/d' | tail -n1 || true)"
+    exec_bin="${exec_line%% *}"; exec_bin="${exec_bin#[-@+!]}"
+    unit="$(systemctl show -p FragmentPath --value "${SERVICE}.service" 2>/dev/null || true)"
     case "$exec_line" in
       "") ;;
       "/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run") ;;  # 官方安装包
-      *" run -c $CONF")
-        is_elf "${exec_line%% *}" || CONFLICTS+=("sing-box.service 的启动程序不是 sing-box：$exec_line") ;;
-      *) CONFLICTS+=("sing-box.service 的启动命令不是官方或本脚本的写法：$exec_line") ;;
+      *)
+        if [[ ! -e "$exec_bin" ]]; then
+          # 启动程序已经不存在：旧脚本删掉后留下的服务文件。本脚本会改用自己的服务文件。
+          if [[ -n "$unit" && -f "$unit" ]] && ! pkg_owns "$unit"; then
+            LEFTOVERS+=("$unit —— 失效的服务文件（启动程序 $exec_bin 已不存在）")
+            LEFTOVER_FILES+=("$unit")
+          fi
+        elif [[ "$exec_line" == *" run -c $CONF" ]] && is_elf "$(readlink -f "$exec_bin")"; then
+          :  # 本脚本写的服务文件
+        else
+          CONFLICTS+=("sing-box.service 的启动命令不是官方或本脚本的写法：$exec_line")
+        fi ;;
     esac
   fi
-  if [[ -f /lib/systemd/system/sing-box.service ]] && grep -q "$CONF_DIR/bin/sing-box" /lib/systemd/system/sing-box.service 2>/dev/null; then
-    CONFLICTS+=("/lib/systemd/system/sing-box.service —— 由其他脚本写入")
-  fi
 
+  # 多余的配置文件（官方服务会把 /etc/sing-box 下所有 .json 合并加载）
   shopt -s nullglob
   for f in "$CONF_DIR"/*.json; do
-    [[ "$f" == "$CONF" ]] || CONFLICTS+=("$f —— 多出来的配置文件（官方服务会把 $CONF_DIR 下所有 .json 合并加载）")
+    if [[ "$f" != "$CONF" ]]; then
+      CONFLICTS+=("$f —— 多出来的配置文件（官方服务会把 $CONF_DIR 下所有 .json 合并加载）")
+      FOREIGN_RM+=("$f")
+    fi
   done
   shopt -u nullglob
 
   if [[ -f "$CONF" ]]; then
     if ! jq -e . "$CONF" >/dev/null 2>&1; then
       CONFLICTS+=("$CONF —— 不是合法的 JSON")
-    elif ! jq -e '.inbounds | type == "array"' "$CONF" >/dev/null 2>&1; then
+    elif ! conf_is_ours; then
       CONFLICTS+=("$CONF —— 没有 inbounds 数组（其他脚本的配置格式，节点放在别的地方）")
     fi
+  fi
+
+  # 旧脚本加进 /root/.bashrc 的别名
+  if grep -qE "$OLD_ALIAS_RE" /root/.bashrc 2>/dev/null; then
+    LEFTOVERS+=("/root/.bashrc —— 旧脚本加的 alias sb / alias sing-box（会让 sb 指向已不存在的旧命令）")
+    LEFTOVER_ALIAS=1
   fi
 
   [[ -d /etc/caddy/233boy ]] && OTHER_CADDY=1
   (( ${#CONFLICTS[@]} > 0 ))
 }
 
+clean_leftovers() {
+  # 只在没有其他脚本仍在使用时调用：备份后自动删除残留
+  (( ${#LEFTOVER_FILES[@]} + ${#LEFTOVER_DIRS[@]} + LEFTOVER_ALIAS > 0 )) || return 0
+  local item f d B items=()
+  echo "发现旧 sing-box 脚本留下的残留（旧脚本本身已经不在了），先备份再自动清理："
+  for item in "${LEFTOVERS[@]}"; do echo "  - $item"; done
+  items=("${LEFTOVER_FILES[@]}")
+  (( LEFTOVER_ALIAS )) && items+=(/root/.bashrc)
+  if (( ${#items[@]} )); then
+    B="/root/singbox-leftovers-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar czf "$B" --ignore-failed-read "${items[@]}" 2>/dev/null || [[ -s "$B" ]] || die "残留备份失败，未做任何清理"
+    chmod 600 "$B"
+  fi
+  for f in "${LEFTOVER_FILES[@]}"; do
+    rm -f "$f"
+    [[ "$f" == *.service ]] && LEFTOVER_UNIT=1
+  done
+  for d in "${LEFTOVER_DIRS[@]}"; do rmdir "$d" 2>/dev/null || true; done
+  if (( LEFTOVER_ALIAS )); then
+    sed -i -E "\#${OLD_ALIAS_RE}#d" /root/.bashrc
+    CLEANED_ALIAS=1
+  fi
+  (( LEFTOVER_UNIT )) && systemctl daemon-reload
+  echo "残留已清理${B:+，备份在 $B}。你的节点配置没有改动。"
+  alias_notice
+}
+alias_notice() {
+  (( CLEANED_ALIAS )) || return 0
+  cat <<'TXT'
+注意：当前这个终端里，旧的 sb 别名可能还在生效。请运行下面这一行（或者重新登录 SSH）后再用 sb：
+
+unalias sb sing-box 2>/dev/null; hash -r
+
+TXT
+}
+
 conflict_report() {
-  local item self
+  local item self keep=0 n=0 q
   self="./singbox-manager.sh"
+  if conf_is_ours; then keep=1; n="$(jq '.inbounds | length' "$CONF")"; fi
   cat >&2 <<TXT
 
 ==================== 检测到其他 sing-box 脚本 ====================
-这台服务器上已经装了：${OTHER_NAME}
+这台服务器上还装着：${OTHER_NAME}
 它和本脚本的配置格式、程序位置、systemd 服务都不一样，两个脚本不能同时管理同一个 sing-box。
 本脚本没有修改任何 sing-box 文件，已停止。
 
-发现的痕迹：
+还在使用中的痕迹：
 TXT
   for item in "${CONFLICTS[@]}"; do echo "  - $item" >&2; done
+  if (( ${#LEFTOVERS[@]} )); then
+    echo "另外还有这些残留（处理完上面的问题后，本脚本会自动备份并清理）：" >&2
+    for item in "${LEFTOVERS[@]}"; do echo "  - $item" >&2; done
+  fi
   cat >&2 <<TXT
 
 如果你想继续用原来的脚本，就不要运行本脚本。
-如果要换成本脚本，请先确认旧节点已不再需要（旧节点会全部失效），然后逐行复制运行下面的命令。
-第一段只做备份，不删除任何东西：
+要换成本脚本，请逐行复制运行下面的命令。第一段只做备份，不删除任何东西：
 
 B=/root/old-singbox-\$(date +%Y%m%d-%H%M%S).tar.gz
 tar czf "\$B" --ignore-failed-read /etc/sing-box /var/log/sing-box /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb /root/.bashrc
 chmod 600 "\$B"
 ls -lh "\$B"
 
-确认上面显示出了备份文件，再运行下面的清理命令：
+TXT
+  if (( keep )); then
+    q=""
+    for item in "${FOREIGN_RM[@]}"; do q+=" $(printf '%q' "$item")"; done
+    cat >&2 <<TXT
+$CONF 已经是本脚本的格式（${n} 个节点），清理时会保留它，只删除其他脚本的部分。
+确认上面显示出了备份文件，再运行：
+
+systemctl stop sing-box
+TXT
+    [[ -n "$q" ]] && echo "rm -rf$q" >&2
+    cat >&2 <<TXT
+sed -i.bak -E '\#${OLD_ALIAS_RE}#d' /root/.bashrc
+unalias sb sing-box 2>/dev/null; hash -r
+
+然后在本脚本所在目录重新安装（已有节点会保留）：
+
+${self} install
+TXT
+  else
+    cat >&2 <<TXT
+旧脚本的节点会全部失效，请先确认不再需要。确认上面显示出了备份文件，再运行下面的清理命令：
 
 systemctl disable --now sing-box
 dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box
 rm -rf /etc/sing-box /var/log/sing-box
 rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb
-sed -i.bak -e '\#^alias sb=/usr/local/bin/sing-box\$#d' -e '\#^alias sing-box=/usr/local/bin/sing-box\$#d' /root/.bashrc
+sed -i.bak -E '\#${OLD_ALIAS_RE}#d' /root/.bashrc
 systemctl daemon-reload
 unalias sb sing-box 2>/dev/null; hash -r
 
@@ -304,6 +426,7 @@ unalias sb sing-box 2>/dev/null; hash -r
 
 ${self} install
 TXT
+  fi
   if (( OTHER_CADDY )); then
     cat >&2 <<'TXT'
 
@@ -318,7 +441,10 @@ TXT
   echo "==================================================================" >&2
   exit 1
 }
-check_no_conflicts() { if detect_conflicts; then conflict_report; fi; }
+check_no_conflicts() {
+  if detect_conflicts; then conflict_report; fi
+  clean_leftovers
+}
 
 # ---------- 通用 ----------
 port_free() {
@@ -415,10 +541,15 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 UNIT
+  chmod 644 /etc/systemd/system/sing-box.service
   systemctl daemon-reload
 }
 reload_service() {
-  if ! systemctl cat "${SERVICE}.service" >/dev/null 2>&1; then
+  # 没有服务文件，或服务文件里的启动程序不是可用的 sing-box 时，写入本脚本的服务文件
+  local exec_bin
+  exec_bin="$(systemctl cat "${SERVICE}.service" 2>/dev/null | sed -n 's/^ExecStart=//p' | sed '/^[[:space:]]*$/d' | tail -n1 | awk '{print $1}' || true)"
+  exec_bin="${exec_bin#[-@+!]}"
+  if [[ -z "$exec_bin" ]] || ! is_elf "$(readlink -f "$exec_bin" 2>/dev/null || echo "$exec_bin")"; then
     write_unit
   fi
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
@@ -739,6 +870,7 @@ main() {
       else
         echo "安装完成。运行：$(self_cmd) menu"
       fi
+      alias_notice
       ;;
     menu)
       need_jq

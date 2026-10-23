@@ -131,11 +131,28 @@ sb links
 
 ## 已装过其他 sing-box 脚本
 
-如果服务器上已经装过别的 sing-box 一键脚本（例如 233boy 的 sing-box 脚本，它也会占用 `sing-box` 和 `sb` 这两个命令），本脚本会停下并列出发现的痕迹，**不会自动删除任何东西**。两个脚本不能同时管理同一个 sing-box。
+### 旧脚本已经删掉，只剩残留：自动清理
 
-想继续用原来的脚本，就不要运行本脚本。要换成本脚本，请先确认旧节点已不再需要（清理后旧节点全部失效），然后按下面的顺序操作。
+如果你已经卸载或手动删掉了旧脚本（例如 233boy 的 sing-box 脚本），但还留着下面这些东西，`install` 和打开菜单时会**先备份、再自动清理**，然后继续安装，不需要你手动处理：
 
-先备份，这一步不删除任何东西：
+- 失效的 `/usr/local/bin/sing-box`、`/usr/local/bin/sb` 链接（指向已经不存在的旧脚本）
+- `/root/.bashrc` 里旧脚本加的 `alias sb=/usr/local/bin/sing-box` 和 `alias sing-box=/usr/local/bin/sing-box`（它们会让 `sb` 报 “No such file or directory”）
+- 启动程序已经不存在的 sing-box 服务文件
+- 旧脚本留下的空目录 `/etc/sing-box/sh`、`bin`、`conf`
+
+备份保存在 `/root/singbox-leftovers-时间戳.tar.gz`。你的节点配置不会被改动。
+
+如果清理掉了别名，当前这个终端里旧别名可能还在生效，运行下面这一行（或者重新登录 SSH）后再用 `sb`：
+
+```bash
+unalias sb sing-box 2>/dev/null; hash -r
+```
+
+### 旧脚本还在使用：脚本会停下
+
+如果旧脚本还在使用（它的程序目录、节点目录、管理命令、服务或配置还在），本脚本会停下并列出发现的痕迹，**不会自动删除任何东西**。两个脚本不能同时管理同一个 sing-box。想继续用原来的脚本，就不要运行本脚本。
+
+要换成本脚本，按屏幕上打印的命令操作。第一段只做备份，不删除任何东西：
 
 ```bash
 B=/root/old-singbox-$(date +%Y%m%d-%H%M%S).tar.gz
@@ -144,25 +161,32 @@ chmod 600 "$B"
 ls -lh "$B"
 ```
 
-确认上面显示出了备份文件，再清理旧脚本：
+接下来分两种情况，脚本会自动判断并打印对应的命令：
+
+**`/etc/sing-box/config.json` 已经是本脚本的格式**（例如你已经用本脚本加过节点）：会保留这份配置和你的节点，只删除旧脚本的部分。打印出的命令类似这样（具体路径以屏幕上为准）：
+
+```bash
+systemctl stop sing-box
+rm -rf /etc/sing-box/sh /etc/sing-box/bin /etc/sing-box/conf /usr/local/bin/sing-box /usr/local/bin/sb
+sed -i.bak -E '\#^alias (sb|sing-box)=/usr/local/bin/sing-box$#d' /root/.bashrc
+unalias sb sing-box 2>/dev/null; hash -r
+./singbox-manager.sh install
+```
+
+**配置还是旧脚本的格式**：旧脚本的节点会全部失效，请先确认不再需要，然后运行：
 
 ```bash
 systemctl disable --now sing-box
 dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box
 rm -rf /etc/sing-box /var/log/sing-box
 rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb
-sed -i.bak -e '\#^alias sb=/usr/local/bin/sing-box$#d' -e '\#^alias sing-box=/usr/local/bin/sing-box$#d' /root/.bashrc
+sed -i.bak -E '\#^alias (sb|sing-box)=/usr/local/bin/sing-box$#d' /root/.bashrc
 systemctl daemon-reload
 unalias sb sing-box 2>/dev/null; hash -r
-```
-
-然后在 `singbox-manager.sh` 所在目录重新安装：
-
-```bash
 ./singbox-manager.sh install
 ```
 
-说明：`tar` 提示某些文件 “Cannot stat” 是正常的，表示这台机器上本来就没有那个文件。`sed` 那一行只删除 233boy 脚本加进 `/root/.bashrc` 的两条别名，原文件另存为 `/root/.bashrc.bak`。
+说明：`tar` 提示某些文件 “Cannot stat” 是正常的，表示这台机器上本来就没有那个文件。`sed` 那一行只删除旧脚本加进 `/root/.bashrc` 的两条别名，原文件另存为 `/root/.bashrc.bak`。
 
 如果 233boy 脚本还装了 Caddy（存在 `/etc/caddy/233boy` 目录），它通常占用 80/443 端口，会和 Reality 默认的 443 冲突。确定不再需要时，先备份再停用：
 
