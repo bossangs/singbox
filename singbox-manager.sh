@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # @bossangs-singbox-manager
-# singbox-manager.sh — Debian 13 / systemd sing-box multi-protocol manager
+# singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu (systemd) and Alpine (OpenRC)
 # https://github.com/bossangs/singbox
-# Supports VLESS + Reality, Hysteria2, TUIC, AnyTLS, Shadowsocks.
+# Supports VLESS + Reality, Hysteria2, TUIC, AnyTLS, Shadowsocks, relays and port forwarding.
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
 # If another sing-box one-click script is detected, nothing is changed; cleanup steps are printed instead.
 
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.23.2"
+SCRIPT_VERSION="2026.10.23.4"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -22,10 +22,54 @@ SERVICE="sing-box"
 # sing-box 官方 deb/rpm 包自带示例配置里的 Shadowsocks 密码（公开的，不能留在线上）
 OFFICIAL_SAMPLE_PW="Gn1JUS14bLUHgv1cWDDp4A=="
 SB=""
+OPENRC_INIT="/etc/init.d/sing-box"
+OPENRC_CONFD="/etc/conf.d/sing-box"
+SB_LOG="/var/log/sing-box.log"
+INIT_SYS=""   # systemd / openrc / none
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo -i"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+detect_init() {
+  if have systemctl && [[ -d /run/systemd/system ]]; then INIT_SYS=systemd
+  elif have rc-service && { have openrc-run || [[ -x /sbin/openrc-run ]]; }; then INIT_SYS=openrc
+  elif have systemctl; then INIT_SYS=systemd
+  else INIT_SYS=none; fi
+}
+is_openrc() { [[ "$INIT_SYS" == openrc ]]; }
+need_init() { [[ "$INIT_SYS" != none ]] || die "没有找到 systemd 或 OpenRC，无法管理 sing-box 服务（Alpine 请先运行：apk add openrc）"; }
+trim_log() {
+  # OpenRC 下日志写到文件；超过 20MB 时只保留最后 5000 行
+  [[ -f "$SB_LOG" ]] || return 0
+  if (( $(wc -c <"$SB_LOG") > 20971520 )); then
+    tail -n 5000 "$SB_LOG" >"$SB_LOG.tmp" && cat "$SB_LOG.tmp" >"$SB_LOG"
+    rm -f "$SB_LOG.tmp"
+  fi
+}
+svc_restart() {
+  need_init
+  if is_openrc; then trim_log; rc-service "$SERVICE" restart; else systemctl restart "$SERVICE"; fi
+}
+svc_enable() {
+  if is_openrc; then rc-update add "$SERVICE" default >/dev/null 2>&1 || true
+  else systemctl enable "$SERVICE" >/dev/null 2>&1 || true; fi
+}
+svc_status() {
+  if is_openrc; then rc-service "$SERVICE" status || true
+  elif [[ "$INIT_SYS" == systemd ]]; then systemctl --no-pager --full status "$SERVICE" || true
+  else echo "没有找到 systemd 或 OpenRC"; fi
+}
+svc_logs() {
+  local n="${1:-100}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=100
+  if is_openrc; then
+    if [[ -s "$SB_LOG" ]]; then tail -n "$n" "$SB_LOG"; else echo "暂无日志（$SB_LOG）"; fi
+  else
+    journalctl -u "$SERVICE" -n "$n" --no-pager
+  fi
+}
+svc_log_hint() { if is_openrc; then echo "tail -n 50 $SB_LOG"; else echo "journalctl -u sing-box -n 50 --no-pager"; fi; }
+svc_daemon_reload() { if [[ "$INIT_SYS" == systemd ]]; then systemctl daemon-reload; fi; }
 pause() { read -r -p "按回车继续..." _ || true; }
 random_hex() { openssl rand -hex "${1:-8}"; }
 new_uuid() { "$SB" generate uuid; }
@@ -210,16 +254,30 @@ LEFTOVER_FILES=()     # 可自动备份并删除的残留文件/失效链接
 LEFTOVER_DIRS=()      # 可自动删除的空目录
 LEFTOVER_ALIAS=0      # /root/.bashrc 里旧脚本的 alias
 LEFTOVER_UNIT=0       # 删除了 systemd 服务文件，需要 daemon-reload
+LEFTOVER_SVC=0        # 删除了失效的服务文件，需要重新写入本脚本的服务文件
 CLEANED_ALIAS=0
 OTHER_NAME="另一个 sing-box 一键脚本"
 OTHER_CADDY=0
 OLD_ALIAS_RE='^alias (sb|sing-box)=/usr/local/bin/sing-box$'
+openrc_is_official() {
+  # 官方 apk 包的服务文件：属于 sing-box 包，且启动程序就是包里的 /usr/bin/sing-box
+  # （apk 改过内容的包文件依然算“属于包”，所以必须再核对内容）
+  local c
+  [[ -f "$1" ]] && pkg_owns "$1" || return 1
+  c="$(openrc_cmd "$1")"
+  [[ "$c" == /usr/bin/sing-box ]] && is_elf /usr/bin/sing-box
+}
+openrc_cmd() { sed -n 's/^[[:space:]]*command=["'"'"']\{0,1\}\([^"'"'"' ]*\).*/\1/p' "$1" 2>/dev/null | head -n1; }
 is_dangling() { [[ -L "$1" && ! -e "$1" ]]; }
 dir_has_files() { [[ -d "$1" ]] && [[ -n "$(find "$1" -mindepth 1 -print -quit 2>/dev/null)" ]]; }
 conf_is_ours() { [[ -f "$CONF" ]] && jq -e '.inbounds | type == "array"' "$CONF" >/dev/null 2>&1; }
 pkg_owns() {
   # Debian 13 是 usr 合并布局：/lib 就是 /usr/lib，dpkg 里两种路径都可能出现
   local c
+  if have apk && ! have dpkg; then
+    apk info -q --who-owns "$1" >/dev/null 2>&1
+    return
+  fi
   have dpkg || return 1
   for c in "$1" "$(readlink -f "$1" 2>/dev/null || true)" "/usr${1#/usr}" "${1#/usr}"; do
     [[ -n "$c" ]] && dpkg -S "$c" >/dev/null 2>&1 && return 0
@@ -299,6 +357,18 @@ detect_conflicts() {
     esac
   fi
 
+  # OpenRC 服务（Alpine）
+  if [[ -f "$OPENRC_INIT" ]] && ! is_our_script "$OPENRC_INIT" && ! openrc_is_official "$OPENRC_INIT"; then
+    exec_bin="$(openrc_cmd "$OPENRC_INIT")"
+    if [[ -n "$exec_bin" && ! -e "$exec_bin" ]]; then
+      LEFTOVERS+=("$OPENRC_INIT —— 失效的 OpenRC 服务文件（启动程序 $exec_bin 已不存在）")
+      LEFTOVER_FILES+=("$OPENRC_INIT")
+    else
+      CONFLICTS+=("$OPENRC_INIT —— 其他脚本写的 OpenRC 服务文件（启动程序 ${exec_bin:-无法识别}）")
+      FOREIGN_RM+=("$OPENRC_INIT")
+    fi
+  fi
+
   # 多余的配置文件（官方服务会把 /etc/sing-box 下所有 .json 合并加载）
   shopt -s nullglob
   for f in "$CONF_DIR"/*.json; do
@@ -341,15 +411,16 @@ clean_leftovers() {
     chmod 600 "$B"
   fi
   for f in "${LEFTOVER_FILES[@]}"; do
+    if [[ "$f" == "$OPENRC_INIT" ]]; then rc-update del "$SERVICE" default >/dev/null 2>&1 || true; LEFTOVER_SVC=1; fi
     rm -f "$f"
-    [[ "$f" == *.service ]] && LEFTOVER_UNIT=1
+    if [[ "$f" == *.service ]]; then LEFTOVER_UNIT=1; LEFTOVER_SVC=1; fi
   done
   for d in "${LEFTOVER_DIRS[@]}"; do rmdir "$d" 2>/dev/null || true; done
   if (( LEFTOVER_ALIAS )); then
     sed -i -E "\#${OLD_ALIAS_RE}#d" /root/.bashrc
     CLEANED_ALIAS=1
   fi
-  (( LEFTOVER_UNIT )) && systemctl daemon-reload
+  (( LEFTOVER_UNIT )) && svc_daemon_reload
   echo "残留已清理${B:+，备份在 $B}。你的节点配置没有改动。"
   alias_notice
 }
@@ -364,14 +435,27 @@ TXT
 }
 
 conflict_report() {
-  local item self keep=0 n=0 q
+  local item self keep=0 n=0 q stop_cmd disable_cmd purge_cmd svc_files reload_cmd
   self="./singbox-manager.sh"
+  if is_openrc; then
+    stop_cmd="rc-service sing-box stop"
+    disable_cmd="rc-service sing-box stop; rc-update del sing-box default"
+    purge_cmd="apk info -e sing-box >/dev/null 2>&1 && apk del sing-box"
+    svc_files="/etc/init.d/sing-box /etc/conf.d/sing-box"
+    reload_cmd=""
+  else
+    stop_cmd="systemctl stop sing-box"
+    disable_cmd="systemctl disable --now sing-box"
+    purge_cmd="dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box"
+    svc_files="/etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service"
+    reload_cmd="systemctl daemon-reload"
+  fi
   if conf_is_ours; then keep=1; n="$(jq '.inbounds | length' "$CONF")"; fi
   cat >&2 <<TXT
 
 ==================== 检测到其他 sing-box 脚本 ====================
 这台服务器上还装着：${OTHER_NAME}
-它和本脚本的配置格式、程序位置、systemd 服务都不一样，两个脚本不能同时管理同一个 sing-box。
+它和本脚本的配置格式、程序位置、系统服务都不一样，两个脚本不能同时管理同一个 sing-box。
 本脚本没有修改任何 sing-box 文件，已停止。
 
 还在使用中的痕迹：
@@ -387,7 +471,7 @@ TXT
 要换成本脚本，请逐行复制运行下面的命令。第一段只做备份，不删除任何东西：
 
 B=/root/old-singbox-\$(date +%Y%m%d-%H%M%S).tar.gz
-tar czf "\$B" --ignore-failed-read /etc/sing-box /var/log/sing-box /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb /root/.bashrc
+tar czf "\$B" --ignore-failed-read /etc/sing-box /var/log/sing-box ${svc_files} /usr/local/bin/sing-box /usr/local/bin/sb /root/.bashrc
 chmod 600 "\$B"
 ls -lh "\$B"
 
@@ -399,7 +483,7 @@ TXT
 $CONF 已经是本脚本的格式（${n} 个节点），清理时会保留它，只删除其他脚本的部分。
 确认上面显示出了备份文件，再运行：
 
-systemctl stop sing-box
+${stop_cmd}
 TXT
     [[ -n "$q" ]] && echo "rm -rf$q" >&2
     cat >&2 <<TXT
@@ -414,12 +498,12 @@ TXT
     cat >&2 <<TXT
 旧脚本的节点会全部失效，请先确认不再需要。确认上面显示出了备份文件，再运行下面的清理命令：
 
-systemctl disable --now sing-box
-dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box
+${disable_cmd}
+${purge_cmd}
 rm -rf /etc/sing-box /var/log/sing-box
-rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service /usr/local/bin/sing-box /usr/local/bin/sb
-sed -i.bak -E '\#${OLD_ALIAS_RE}#d' /root/.bashrc
-systemctl daemon-reload
+rm -f ${svc_files} /usr/local/bin/sing-box /usr/local/bin/sb
+sed -i.bak -E '\#${OLD_ALIAS_RE}#d' /root/.bashrc${reload_cmd:+
+$reload_cmd}
 unalias sb sing-box 2>/dev/null; hash -r
 
 清理完成后，在本脚本所在目录重新安装：
@@ -455,28 +539,46 @@ port_free() {
     ! ss -H -lnu "( sport = :$p )" 2>/dev/null | grep -q .
   fi
 }
-check_port() {
-  local p="$1" proto="$2"
-  valid_port "$p" || die "端口必须是 1-65535 的数字"
-  port_free "$p" "$proto" || die "端口 $p/$proto 已被占用，请换一个端口"
-}
 backup_config() {
   mkdir -p "$BACKUP_DIR" "$DATA" "$CERT_DIR"
+  LAST_BACKUP=""
   if [[ -f "$CONF" ]]; then
-    cp -a "$CONF" "$BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S).json"
+    LAST_BACKUP="$BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S-%N).json"
+    cp -a "$CONF" "$LAST_BACKUP"
   fi
 }
 install_deps() {
+  if have apk && ! have apt-get; then
+    apk update
+    # Alpine 默认只有 BusyBox，补齐脚本用到的 GNU 工具和 ss
+    apk add bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc
+    return
+  fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y ca-certificates curl jq openssl iproute2
 }
+latest_sb_version() {
+  # 通过 releases/latest 的跳转读取版本号，不占用 GitHub API 次数
+  curl -fsSI --max-time 15 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/v##p' | head -n1
+}
 install_singbox() {
   if ! resolve_sb; then
     echo "正在通过 sing-box 官方安装脚本安装内核……"
-    curl -fsSL https://sing-box.app/install.sh -o /tmp/sing-box-install.sh
-    bash /tmp/sing-box-install.sh
+    local v ok=0
+    v="$(latest_sb_version || true)"
+    if curl -fsSL https://sing-box.app/install.sh -o /tmp/sing-box-install.sh; then
+      if [[ "$v" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+        bash /tmp/sing-box-install.sh --version "$v" && ok=1
+      else
+        bash /tmp/sing-box-install.sh && ok=1
+      fi
+    fi
     rm -f /tmp/sing-box-install.sh
+    if (( ! ok )) && have apk; then
+      echo "官方安装没有成功，改用 Alpine 软件源里的 sing-box。"
+      apk add sing-box sing-box-openrc || apk add sing-box
+    fi
   fi
   resolve_sb || die "未找到 sing-box 程序，请检查官方安装是否成功"
   "$SB" version
@@ -544,7 +646,57 @@ UNIT
   chmod 644 /etc/systemd/system/sing-box.service
   systemctl daemon-reload
 }
+write_openrc_init() {
+  cat >"$OPENRC_INIT" <<RC
+#!/sbin/openrc-run
+${MARK}
+name="sing-box"
+description="sing-box service (singbox-manager)"
+supervisor="supervise-daemon"
+command="${SB}"
+command_args="run -c ${CONF}"
+output_log="${SB_LOG}"
+error_log="${SB_LOG}"
+respawn_delay=3
+respawn_max=0
+rc_ulimit="-n 1048576"
+extra_commands="checkconfig"
+
+depend() {
+  after net dns firewall
+}
+
+checkconfig() {
+  ebegin "Checking \$RC_SVCNAME configuration"
+  "\$command" check -c "${CONF}"
+  eend \$?
+}
+
+start_pre() {
+  checkconfig
+}
+RC
+  chmod 755 "$OPENRC_INIT"
+}
+ensure_openrc_service() {
+  # 官方 apk 包自带的服务文件可用时沿用它（只补上日志文件位置），否则写入本脚本的服务文件
+  if ! is_our_script "$OPENRC_INIT" && openrc_is_official "$OPENRC_INIT"; then
+    if ! grep -q '^output_log=' "$OPENRC_CONFD" 2>/dev/null; then
+      printf '\n%s\noutput_log="%s"\nerror_log="%s"\n' "# singbox-manager：把 sing-box 日志写到文件" "$SB_LOG" "$SB_LOG" >>"$OPENRC_CONFD"
+    fi
+    return 0
+  fi
+  write_openrc_init
+}
 reload_service() {
+  need_init
+  if is_openrc; then
+    ensure_openrc_service
+    touch "$SB_LOG"; chmod 600 "$SB_LOG"
+    svc_enable
+    svc_restart
+    return
+  fi
   # 没有服务文件，或服务文件里的启动程序不是可用的 sing-box 时，写入本脚本的服务文件
   local exec_bin
   exec_bin="$(systemctl cat "${SERVICE}.service" 2>/dev/null | sed -n 's/^ExecStart=//p' | sed '/^[[:space:]]*$/d' | tail -n1 | awk '{print $1}' || true)"
@@ -552,23 +704,47 @@ reload_service() {
   if [[ -z "$exec_bin" ]] || ! is_elf "$(readlink -f "$exec_bin" 2>/dev/null || echo "$exec_bin")"; then
     write_unit
   fi
-  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE"
+  svc_enable
+  svc_restart
 }
-apply_json() {
-  local obj="$1"
+LAST_BACKUP=""
+commit_jq() {
+  # 用 jq 修改配置：先备份，再校验；校验或重启失败时恢复修改前的配置
+  local tmp="${CONF}.tmp"
   backup_config
-  jq --argjson obj "$obj" '.inbounds += [$obj]' "$CONF" >"${CONF}.tmp"
-  install -m 600 "${CONF}.tmp" "$CONF"
-  rm -f "${CONF}.tmp"
+  if ! jq "$@" "$CONF" >"$tmp"; then rm -f "$tmp"; die "生成新配置失败，未做任何改动"; fi
+  install -m 600 "$tmp" "$CONF"
+  rm -f "$tmp"
   if ! check_config; then
-    echo "配置校验失败，正在恢复备份。"
-    local latest
-    latest="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-    [[ -n "$latest" ]] && cp -a "$latest" "$CONF"
-    die "sing-box 配置校验失败；已尝试恢复最近备份"
+    [[ -n "$LAST_BACKUP" ]] && cp -a "$LAST_BACKUP" "$CONF"
+    die "sing-box 配置校验失败，已恢复修改前的配置（没有任何改动）"
   fi
-  reload_service
+  if ! reload_service; then
+    [[ -n "$LAST_BACKUP" ]] && cp -a "$LAST_BACKUP" "$CONF"
+    svc_restart || true
+    die "sing-box 重启失败，已恢复修改前的配置。查看日志：$(svc_log_hint)"
+  fi
+}
+RELAY_OUT=""     # 中转：落地出站 JSON（不含 tag）
+RELAY_DESC=""    # 中转：落地说明
+RULE_TO=""       # 端口转发：入站固定走的出站 tag
+TAG_PREFIX=""    # 中转入口节点名前缀
+LAST_TAG=""
+apply_json() {
+  # 添加入站；中转时同时添加落地出站和“只匹配这个入站”的路由规则（放在最前面）
+  local obj="$1" out="${RELAY_OUT:-null}"
+  [[ -n "$out" ]] || out=null
+  commit_jq --argjson obj "$obj" --argjson out "$out" --arg to "$RULE_TO" '
+    .inbounds += [$obj]
+    | .route = (.route // {})
+    | if $out != null then
+        ($out + {tag: ("to-" + $obj.tag)}) as $o
+        | .outbounds = ((.outbounds // []) + [$o])
+        | .route.rules = ([{inbound: [$obj.tag], outbound: $o.tag}] + (.route.rules // []))
+      elif $to != "" then
+        (if ([.outbounds[]? | select(.tag == $to)] | length) == 0 then .outbounds = ((.outbounds // []) + [{type: "direct", tag: $to}]) else . end)
+        | .route.rules = ([{inbound: [$obj.tag], outbound: $to}] + (.route.rules // []))
+      else . end'
 }
 ask_tls_host() {
   # $1：默认值（服务器地址）
@@ -587,6 +763,22 @@ ask_tls_host() {
     chmod 600 "$CERT_DIR/server.key"
     chmod 644 "$CERT_DIR/server.crt"
   fi
+}
+tag_exists() {
+  jq -e --arg t "$1" '[.inbounds[]?, .outbounds[]? | select(.tag == $t)] | length > 0' "$CONF" >/dev/null 2>&1 || [[ -e "$DATA/$1.json" ]]
+}
+next_tag() {
+  local base="$1" n=1
+  while tag_exists "${base}-${n}"; do n=$((n + 1)); done
+  printf '%s-%s' "$base" "$n"
+}
+ask_tag() {
+  # $1：变量名；$2：默认前缀
+  local __t
+  prompt __t "节点名称" "$(next_tag "${TAG_PREFIX}$2")"
+  valid_tag "$__t"
+  tag_exists "$__t" && die "节点名称 $__t 已存在，请换一个"
+  printf -v "$1" '%s' "$__t"
 }
 
 # ---------- 分享链接 ----------
@@ -618,18 +810,41 @@ print_link() {
 save_node() {
   # $1：节点 tag；$2：凭据 JSON。保存后显示参数和分享链接
   local f="$DATA/$1.json"
-  printf '%s\n' "$2" >"$f"
+  jq --arg r "$RELAY_DESC" 'if $r != "" then . + {relay_to: $r} else . end' <<<"$2" >"$f"
   chmod 600 "$f"
+  LAST_TAG="$1"
   jq . "$f"
   print_link "$f"
+}
+
+# ---------- 端口 ----------
+port_in_config() { jq -e --argjson p "$1" '[.inbounds[]? | select(.listen_port == $p)] | length > 0' "$CONF" >/dev/null 2>&1; }
+check_port() {
+  local p="$1" proto="$2"
+  valid_port "$p" || die "端口必须是 1-65535 的数字"
+  port_in_config "$((10#$p))" && die "端口 $p 已被配置里的其他节点使用，请换一个端口"
+  port_free "$p" "$proto" || die "端口 $p/$proto 已被占用，请换一个端口"
+}
+free_port() {
+  # 从 $1 开始找一个没被占用的端口；$2：tcp / udp / both
+  local p="$1" proto="${2:-tcp}" i
+  for ((i = 0; i < 500; i++, p++)); do
+    (( p <= 65535 )) || p=20000
+    port_in_config "$p" && continue
+    case "$proto" in
+      both) port_free "$p" tcp && port_free "$p" udp || continue ;;
+      *) port_free "$p" "$proto" || continue ;;
+    esac
+    printf '%s' "$p"; return 0
+  done
+  printf '%s' "$1"
 }
 
 # ---------- 添加节点 ----------
 add_reality() {
   local tag port sni uuid keys priv pub sid obj host
-  prompt tag "节点名称" "reality-1"
-  valid_tag "$tag"
-  prompt port "TCP 端口" "443"
+  ask_tag tag reality
+  prompt port "TCP 端口" "$(free_port 443 tcp)"
   check_port "$port" tcp
   prompt sni "Reality SNI/握手域名" "www.cloudflare.com"
   host="$(public_host)"
@@ -647,9 +862,8 @@ add_reality() {
 }
 add_hy2() {
   local tag port password obj host
-  prompt tag "节点名称" "hy2-1"
-  valid_tag "$tag"
-  prompt port "UDP 端口" "8443"
+  ask_tag tag hy2
+  prompt port "UDP 端口" "$(free_port 8443 udp)"
   check_port "$port" udp
   host="$(public_host)"
   ask_tls_host "$host"
@@ -662,9 +876,8 @@ add_hy2() {
 }
 add_tuic() {
   local tag port uuid password obj host
-  prompt tag "节点名称" "tuic-1"
-  valid_tag "$tag"
-  prompt port "UDP 端口" "9443"
+  ask_tag tag tuic
+  prompt port "UDP 端口" "$(free_port 9443 udp)"
   check_port "$port" udp
   host="$(public_host)"
   ask_tls_host "$host"
@@ -678,9 +891,8 @@ add_tuic() {
 }
 add_anytls() {
   local tag port password obj host
-  prompt tag "节点名称" "anytls-1"
-  valid_tag "$tag"
-  prompt port "TCP 端口" "10443"
+  ask_tag tag anytls
+  prompt port "TCP 端口" "$(free_port 10443 tcp)"
   check_port "$port" tcp
   host="$(public_host)"
   ask_tls_host "$host"
@@ -693,9 +905,8 @@ add_anytls() {
 }
 add_ss() {
   local tag port password method obj host
-  prompt tag "节点名称" "ss-1"
-  valid_tag "$tag"
-  prompt port "TCP 端口" "11443"
+  ask_tag tag ss
+  prompt port "TCP 端口" "$(free_port 11443 tcp)"
   check_port "$port" tcp
   prompt method "加密方式" "aes-128-gcm"
   case "$method" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) ;; *) die "暂不接受该加密方式；请使用 aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305 或对应的 2022-blake3 方法" ;; esac
@@ -712,6 +923,319 @@ add_ss() {
     '{protocol:"Shadowsocks",tag:$tag,server:$host,port:$port,method:$method,password:$password}')"
 }
 
+# ---------- 中转：解析落地节点分享链接 ----------
+urldecode() { local s="${1//+/%2B}"; printf '%b' "${s//%/\\x}"; }
+urlencode() { jq -rn --arg s "$1" '$s|@uri'; }
+b64d() {
+  local s="${1//-/+}"; s="${s//_//}"
+  while (( ${#s} % 4 )); do s+="="; done
+  printf '%s' "$s" | base64 -d 2>/dev/null
+}
+declare -A LQ=()
+L_SCHEME="" L_UI="" L_HOST="" L_PORT="" L_PATH="" L_QUERY=""
+PARSED_OUT="" PARSED_DESC="" PARSED_PROTO=""
+parse_share_link() {
+  # 解析 vless / hysteria2 / hy2 / tuic / anytls / ss 链接，生成 sing-box 出站，结果放在 PARSED_OUT
+  local link="$1" rest frag="" hp kv k v arr=() dec ui
+  link="${link//[[:space:]]/}"
+  [[ "$link" == *://* ]] || die "这不是分享链接（应以 vless:// hysteria2:// tuic:// anytls:// ss:// 开头）"
+  L_SCHEME="${link%%://*}"; L_SCHEME="${L_SCHEME,,}"
+  rest="${link#*://}"
+  if [[ "$rest" == *"#"* ]]; then frag="${rest#*#}"; rest="${rest%%#*}"; fi
+  : "$frag"
+  L_QUERY=""
+  if [[ "$rest" == *"?"* ]]; then L_QUERY="${rest#*\?}"; rest="${rest%%\?*}"; fi
+  if [[ "$L_SCHEME" == ss && "$rest" != *@* ]]; then
+    # 旧格式 ss://base64(method:password@host:port)
+    dec="$(b64d "${rest%/}")"
+    [[ "$dec" == *@* ]] || die "无法解析 ss 链接"
+    L_UI="$(printf '%s' "${dec%@*}" | base64 -w0)"
+    rest="${L_UI}@${dec##*@}"
+  fi
+  [[ "$rest" == *@* ]] || die "链接里缺少 用户信息@地址:端口"
+  L_UI="${rest%@*}"; hp="${rest##*@}"
+  L_PATH=""
+  if [[ "$hp" == */* ]]; then L_PATH="/${hp#*/}"; hp="${hp%%/*}"; fi
+  if [[ "$hp" == \[*\]:* ]]; then
+    L_HOST="${hp%%]*}"; L_HOST="${L_HOST#[}"; L_PORT="${hp##*]:}"
+  else
+    L_HOST="${hp%:*}"; L_PORT="${hp##*:}"
+  fi
+  valid_host "$L_HOST" || die "链接里的服务器地址无效：$L_HOST"
+  valid_port "$L_PORT" || die "链接里的端口无效：$L_PORT"
+  L_PORT="$((10#$L_PORT))"
+  LQ=()
+  if [[ -n "$L_QUERY" ]]; then
+    IFS='&' read -r -a arr <<<"$L_QUERY"
+    for kv in "${arr[@]}"; do
+      [[ -n "$kv" ]] || continue
+      k="${kv%%=*}"; v=""; [[ "$kv" == *=* ]] && v="${kv#*=}"
+      LQ["$k"]="$(urldecode "$v")"
+    done
+  fi
+  local sni="${LQ[sni]:-${LQ[peer]:-}}" ins="${LQ[insecure]:-${LQ[allowInsecure]:-${LQ[allow_insecure]:-0}}}" alpn="${LQ[alpn]:-}" fp="${LQ[fp]:-}"
+  case "$L_SCHEME" in
+    vless)
+      local sec="${LQ[security]:-none}" net="${LQ[type]:-tcp}"
+      [[ -z "${LQ[encryption]:-}" || "${LQ[encryption]}" == none ]] || die "不支持 VLESS encryption=${LQ[encryption]}"
+      case "$net" in tcp|raw|ws|grpc|http|h2|httpupgrade) ;; *) die "不支持的 VLESS 传输方式：$net" ;; esac
+      case "$sec" in none|tls|reality) ;; *) die "不支持的 VLESS security：$sec" ;; esac
+      [[ "$sec" != reality || -n "${LQ[pbk]:-}" ]] || die "Reality 链接缺少 pbk（公钥）"
+      case "$sec" in reality) PARSED_PROTO="VLESS + Reality" ;; tls) PARSED_PROTO="VLESS + TLS" ;; *) PARSED_PROTO="VLESS" ;; esac
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg uuid "$(urldecode "$L_UI")" \
+        --arg flow "${LQ[flow]:-}" --arg sec "$sec" --arg sni "$sni" --arg fp "$fp" --arg pbk "${LQ[pbk]:-}" --arg sid "${LQ[sid]:-}" \
+        --arg ins "$ins" --arg alpn "$alpn" --arg net "$net" --arg path "${LQ[path]:-}" --arg hh "${LQ[host]:-}" --arg svc "${LQ[serviceName]:-}" '
+        {type:"vless", server:$server, server_port:$port, uuid:$uuid}
+        + (if $flow != "" then {flow:$flow} else {} end)
+        + (if $sec == "reality" then
+             {tls:{enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:(if $fp == "" then "chrome" else $fp end)},
+                   reality:{enabled:true, public_key:$pbk, short_id:$sid}}}
+           elif $sec == "tls" then
+             {tls:({enabled:true, server_name:(if $sni == "" then $server else $sni end), insecure:($ins == "1" or $ins == "true")}
+                   + (if $fp != "" then {utls:{enabled:true, fingerprint:$fp}} else {} end)
+                   + (if $alpn != "" then {alpn:($alpn | split(","))} else {} end))}
+           else {} end)
+        + (if $net == "ws" then {transport:({type:"ws", path:(if $path == "" then "/" else $path end)} + (if $hh != "" then {headers:{Host:$hh}} else {} end))}
+           elif $net == "grpc" then {transport:{type:"grpc", service_name:$svc}}
+           elif $net == "http" or $net == "h2" then {transport:({type:"http"} + (if $path != "" then {path:$path} else {} end) + (if $hh != "" then {host:[$hh]} else {} end))}
+           elif $net == "httpupgrade" then {transport:({type:"httpupgrade", path:(if $path == "" then "/" else $path end)} + (if $hh != "" then {host:$hh} else {} end))}
+           else {} end)')" ;;
+    hysteria2|hy2)
+      PARSED_PROTO="Hysteria2"
+      [[ -z "${LQ[obfs]:-}" || "${LQ[obfs]}" == salamander ]] || die "不支持的 Hysteria2 obfs：${LQ[obfs]}"
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg pw "$(urldecode "$L_UI")" --arg sni "$sni" --arg ins "$ins" \
+        --arg alpn "$alpn" --arg obfs "${LQ[obfs]:-}" --arg opw "${LQ[obfs-password]:-}" '
+        {type:"hysteria2", server:$server, server_port:$port, password:$pw,
+         tls:({enabled:true, server_name:(if $sni == "" then $server else $sni end), insecure:($ins == "1" or $ins == "true")}
+              + (if $alpn != "" then {alpn:($alpn | split(","))} else {} end))}
+        + (if $obfs == "salamander" then {obfs:{type:"salamander", password:$opw}} else {} end)')" ;;
+    tuic)
+      PARSED_PROTO="TUIC"
+      ui="$(urldecode "$L_UI")"
+      [[ "$ui" == *:* ]] || die "TUIC 链接应为 tuic://uuid:password@地址:端口"
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg uuid "${ui%%:*}" --arg pw "${ui#*:}" --arg sni "$sni" --arg ins "$ins" \
+        --arg alpn "${alpn:-h3}" --arg cc "${LQ[congestion_control]:-bbr}" --arg urm "${LQ[udp_relay_mode]:-}" '
+        {type:"tuic", server:$server, server_port:$port, uuid:$uuid, password:$pw, congestion_control:$cc,
+         tls:{enabled:true, server_name:(if $sni == "" then $server else $sni end), insecure:($ins == "1" or $ins == "true"), alpn:($alpn | split(","))}}
+        + (if $urm != "" then {udp_relay_mode:$urm} else {} end)')" ;;
+    anytls)
+      PARSED_PROTO="AnyTLS"
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg pw "$(urldecode "$L_UI")" --arg sni "$sni" --arg ins "$ins" '
+        {type:"anytls", server:$server, server_port:$port, password:$pw,
+         tls:{enabled:true, server_name:(if $sni == "" then $server else $sni end), insecure:($ins == "1" or $ins == "true")}}')" ;;
+    ss)
+      PARSED_PROTO="Shadowsocks"
+      [[ -z "${LQ[plugin]:-}" ]] || die "不支持带 plugin 的 ss 链接"
+      ui="$(urldecode "$L_UI")"
+      [[ "$ui" == *:* ]] || ui="$(b64d "$L_UI")"
+      [[ "$ui" == *:* ]] || die "无法解析 ss 链接的加密方式和密码"
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg m "${ui%%:*}" --arg pw "${ui#*:}" \
+        '{type:"shadowsocks", server:$server, server_port:$port, method:$m, password:$pw}')" ;;
+    *) die "暂不支持 $L_SCHEME:// 链接（支持 vless、hysteria2/hy2、tuic、anytls、ss）" ;;
+  esac
+  PARSED_DESC="$PARSED_PROTO $(uri_host "$L_HOST"):$L_PORT"
+}
+manual_landing() {
+  # 手动填写落地节点，拼成分享链接后交给 parse_share_link
+  local c h p a b c2 d link
+  echo "落地节点协议："
+  echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks"
+  read -r -p "选择 [1-5]: " c || die "没有选择协议"
+  prompt h "落地服务器地址（IP 或域名）" ""
+  h="${h#[}"; h="${h%]}"
+  valid_host "$h" || die "地址无效"
+  prompt p "落地端口" ""
+  valid_port "$p" || die "端口无效"
+  h="$(uri_host "$h")"
+  case "$c" in
+    1) prompt a "UUID" ""; prompt b "SNI（握手域名）" "www.cloudflare.com"; prompt c2 "公钥 public_key（pbk）" ""; prompt d "short_id（sid，可留空）" " "
+       d="${d// /}"
+       link="vless://$(urlencode "$a")@${h}:${p}?encryption=none&security=reality&sni=$(urlencode "$b")&fp=chrome&pbk=$(urlencode "$c2")&sid=$(urlencode "$d")&type=tcp&flow=xtls-rprx-vision" ;;
+    2) prompt a "密码" ""; prompt b "SNI（可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
+       link="hysteria2://$(urlencode "$a")@${h}:${p}/?sni=$(urlencode "$b")&insecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
+    3) prompt a "UUID" ""; prompt c2 "密码" ""; prompt b "SNI（可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
+       link="tuic://$(urlencode "$a"):$(urlencode "$c2")@${h}:${p}?congestion_control=bbr&alpn=h3&sni=$(urlencode "$b")&allow_insecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
+    4) prompt a "密码" ""; prompt b "SNI（可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
+       link="anytls://$(urlencode "$a")@${h}:${p}/?sni=$(urlencode "$b")&insecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
+    5) prompt b "加密方式" "aes-128-gcm"; prompt a "密码" ""
+       link="ss://$(printf '%s:%s' "$b" "$a" | base64 -w0)@${h}:${p}" ;;
+    *) die "无效选项" ;;
+  esac
+  parse_share_link "$link"
+}
+read_landing() {
+  local link
+  echo "落地节点：粘贴分享链接（vless / hysteria2 / hy2 / tuic / anytls / ss），直接回车改为手动填写。"
+  read -r -p "落地节点分享链接: " link || link=""
+  if [[ -n "${link//[[:space:]]/}" ]]; then parse_share_link "$link"; else manual_landing; fi
+  echo "落地节点：$PARSED_DESC"
+}
+tcp_reachable() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+# ---------- 中转 / 端口转发 ----------
+RELAY_DIR="$DATA/relays"
+relay_add() {
+  local c landing_host landing_port proto meta
+  read_landing
+  landing_host="$L_HOST"; landing_port="$L_PORT"; proto="$PARSED_PROTO"
+  case "$PARSED_OUT" in
+    *'"type":"vless"'*|*'"type":"anytls"'*|*'"type":"shadowsocks"'*)
+      if tcp_reachable "$landing_host" "$landing_port"; then echo "落地端口 TCP 可以连通。"
+      else echo "提示：从本机连不上落地 ${landing_host}:${landing_port}（TCP），请确认落地节点在运行、防火墙已放行。仍会继续添加。"; fi ;;
+  esac
+  echo
+  echo "中转入口协议（客户端连接本机时用的协议）："
+  echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks"
+  read -r -p "选择 [1-5，默认 1]: " c || c=1
+  RELAY_OUT="$PARSED_OUT"; RELAY_DESC="$PARSED_DESC"; TAG_PREFIX="relay-"; LAST_TAG=""
+  case "${c:-1}" in
+    1) add_reality ;; 2) add_hy2 ;; 3) add_tuic ;; 4) add_anytls ;; 5) add_ss ;;
+    *) die "无效选项" ;;
+  esac
+  mkdir -p "$RELAY_DIR"
+  meta="$RELAY_DIR/$LAST_TAG.json"
+  jq -n --arg tag "$LAST_TAG" --arg desc "$RELAY_DESC" --arg lp "$proto" --arg lh "$landing_host" --argjson lport "$landing_port" \
+    --argjson port "$(jq --arg t "$LAST_TAG" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONF")" \
+    --arg entry "$(jq -r '.protocol' "$DATA/$LAST_TAG.json")" \
+    '{kind:"relay", tag:$tag, entry:$entry, listen_port:$port, landing:{protocol:$lp, server:$lh, port:$lport}, landing_desc:$desc, outbound:("to-" + $tag)}' >"$meta"
+  chmod 600 "$meta"
+  RELAY_OUT=""; RELAY_DESC=""; TAG_PREFIX=""
+  echo
+  echo "中转已添加：客户端 → 本机 ${LAST_TAG}（$(jq -r .entry "$meta")，端口 $(jq -r .listen_port "$meta")） → 落地 $(jq -r .landing_desc "$meta")"
+  echo "只有这个入口的流量走落地，其他节点仍然直连。请在防火墙放行入口端口。"
+}
+forward_add() {
+  local target thost tport net tag port obj meta link_mode=0 def_net="both" def_port
+  echo "端口转发：本机端口收到的 TCP/UDP 流量原样转发到目标地址（不解密，适合转发任意节点）。"
+  prompt target "转发目标（地址:端口，或者直接粘贴落地节点分享链接）" ""
+  target="${target//[[:space:]]/}"
+  [[ -n "$target" ]] || die "目标不能为空"
+  if [[ "$target" == *://* ]]; then
+    parse_share_link "$target"
+    thost="$L_HOST"; tport="$L_PORT"; link_mode=1
+    case "$L_SCHEME" in hysteria2|hy2|tuic) def_net=udp ;; vless|anytls) def_net=tcp ;; *) def_net=both ;; esac
+  else
+    if [[ "$target" == \[*\]:* ]]; then thost="${target%%]*}"; thost="${thost#[}"; tport="${target##*]:}"
+    else thost="${target%:*}"; tport="${target##*:}"; fi
+    valid_host "$thost" || die "目标地址无效：$thost"
+    valid_port "$tport" || die "目标端口无效：$tport"
+    tport="$((10#$tport))"
+  fi
+  prompt net "转发协议 tcp / udp / both" "$def_net"
+  case "$net" in tcp|udp|both) ;; *) die "只能是 tcp、udp 或 both" ;; esac
+  TAG_PREFIX=""
+  ask_tag tag fwd
+  def_port="$(free_port "$tport" "$net")"
+  prompt port "本机监听端口" "$def_port"
+  valid_port "$port" || die "端口无效"
+  port="$((10#$port))"
+  case "$net" in
+    tcp) check_port "$port" tcp ;;
+    udp) check_port "$port" udp ;;
+    both) check_port "$port" tcp; port_free "$port" udp || die "端口 $port/udp 已被占用" ;;
+  esac
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg h "$thost" --argjson tp "$tport" --arg net "$net" \
+    '{type:"direct", tag:$tag, listen:"::", listen_port:$port, override_address:$h, override_port:$tp} + (if $net == "both" then {} else {network:$net} end)')"
+  RELAY_OUT=""; RULE_TO="direct"
+  apply_json "$obj"
+  RULE_TO=""
+  mkdir -p "$RELAY_DIR"
+  meta="$RELAY_DIR/$tag.json"
+  jq -n --arg tag "$tag" --argjson port "$port" --arg net "$net" --arg h "$thost" --argjson tp "$tport" --argjson lm "$link_mode" \
+    --arg scheme "$L_SCHEME" --arg ui "$L_UI" --arg path "$L_PATH" --arg q "$L_QUERY" \
+    '{kind:"forward", tag:$tag, listen_port:$port, network:$net, target:$h, target_port:$tp}
+     + (if $lm == 1 then {link:{scheme:$scheme, userinfo:$ui, path:$path, query:$q}} else {} end)' >"$meta"
+  chmod 600 "$meta"
+  echo
+  echo "端口转发已添加：本机 ${port}/${net} → $(uri_host "$thost"):${tport}"
+  print_forward_link "$meta" "$(public_host)"
+  echo "请在防火墙放行本机端口 ${port}（${net}）。"
+}
+print_forward_link() {
+  # 转发目标是分享链接时：把原链接的地址和端口换成本机，生成给客户端用的新链接
+  local f="$1" h="$2"
+  jq -e '.link' "$f" >/dev/null 2>&1 || {
+    echo "客户端用法：使用落地节点原来的配置，只把地址改成 $h、端口改成 $(jq -r .listen_port "$f")。"
+    return 0
+  }
+  echo "分享链接（落地节点链接，地址已换成本机）："
+  jq -r --arg h "$(uri_host "$h")" '"\(.link.scheme)://\(.link.userinfo)@\($h):\(.listen_port)\(.link.path)\(if .link.query != "" then "?" + .link.query else "" end)#\(.tag)"' "$f"
+}
+relay_list() {
+  local f host kind any=0
+  shopt -s nullglob
+  local files=("$RELAY_DIR"/*.json)
+  shopt -u nullglob
+  ((${#files[@]})) || { echo "还没有中转或端口转发。"; return 0; }
+  host="$(public_host)"
+  for f in "${files[@]}"; do
+    any=1
+    kind="$(jq -r .kind "$f")"
+    if [[ "$kind" == relay ]]; then
+      echo "===== [中转] $(jq -r .tag "$f") ====="
+      echo "客户端 → 本机 $(jq -r .entry "$f")（端口 $(jq -r .listen_port "$f")） → 落地 $(jq -r .landing_desc "$f")"
+      if [[ -f "$DATA/$(jq -r .tag "$f").json" ]]; then
+        jq --arg h "$host" '.server = $h' "$DATA/$(jq -r .tag "$f").json" >"$f.node.tmp"
+        install -m 600 "$f.node.tmp" "$DATA/$(jq -r .tag "$f").json"; rm -f "$f.node.tmp"
+        print_link "$DATA/$(jq -r .tag "$f").json"
+      fi
+    else
+      echo "===== [端口转发] $(jq -r .tag "$f") ====="
+      echo "本机 $(jq -r '"\(.listen_port)/\(.network)"' "$f") → $(uri_host "$(jq -r .target "$f")"):$(jq -r .target_port "$f")"
+      print_forward_link "$f" "$host"
+    fi
+    echo
+  done
+  (( any )) || true
+}
+remove_by_tag() {
+  # 删除入站，以及它对应的落地出站、路由规则、凭据和中转记录
+  local tag="$1" out=""
+  jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONF" >/dev/null || die "未找到节点 $tag"
+  [[ -f "$RELAY_DIR/$tag.json" ]] && out="$(jq -r '.outbound // empty' "$RELAY_DIR/$tag.json")"
+  commit_jq --arg tag "$tag" --arg out "$out" '
+    def inb: (.inbound // []) | if type == "string" then [.] else . end;
+    .inbounds |= map(select(.tag != $tag))
+    | (if $out != "" then .outbounds |= map(select(.tag != $out)) else . end)
+    | (if (.route.rules? | type) == "array" then
+         .route.rules |= (map(if (inb | index($tag)) != null then
+                                 (if (inb | length) == 1 then empty else .inbound = (inb - [$tag]) end)
+                               else . end))
+       else . end)'
+  rm -f "$DATA/${tag}.json" "$RELAY_DIR/${tag}.json"
+  echo "已删除：$tag"
+}
+relay_remove() {
+  local tag="${1:-}"
+  if [[ -z "$tag" ]]; then
+    relay_list
+    prompt tag "要删除的中转/转发名称" ""
+  fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  [[ -f "$RELAY_DIR/$tag.json" ]] || die "没有名为 $tag 的中转或端口转发"
+  remove_by_tag "$tag"
+}
+relay_menu() {
+  local c
+  echo
+  echo "========== 中转 / 端口转发 =========="
+  echo "1) 添加中转（客户端用本脚本的协议连本机，流量转到落地节点）"
+  echo "2) 添加端口转发（TCP/UDP 原样转发到目标地址:端口）"
+  echo "3) 查看中转/转发和分享链接"
+  echo "4) 删除中转/转发"
+  echo "0) 返回"
+  read -r -p "选择 [0-4]: " c || return 0
+  case "$c" in
+    1) relay_add ;;
+    2) forward_add ;;
+    3) relay_list ;;
+    4) relay_remove ;;
+    0) return 0 ;;
+    *) echo "无效选项" ;;
+  esac
+}
+
 # ---------- 管理 ----------
 list_nodes() {
   echo "已配置的入站节点："
@@ -726,14 +1250,7 @@ remove_node() {
   prompt tag "要删除的节点 tag" ""
   [[ -n "$tag" ]] || die "tag 不能为空"
   valid_tag "$tag"
-  jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONF" >/dev/null || die "未找到节点 $tag"
-  backup_config
-  jq --arg tag "$tag" '.inbounds |= map(select(.tag != $tag))' "$CONF" >"${CONF}.tmp"
-  install -m 600 "${CONF}.tmp" "$CONF"
-  rm -f "${CONF}.tmp" "$DATA/${tag}.json"
-  check_config
-  reload_service
-  echo "已删除节点：$tag"
+  remove_by_tag "$tag"
 }
 show_links() {
   # 显示每个节点的参数和分享链接；服务器地址统一使用当前保存的地址
@@ -753,12 +1270,15 @@ show_links() {
     print_link "$f"
     echo
   done
+  if compgen -G "$RELAY_DIR/*.json" >/dev/null; then
+    echo "端口转发和中转详情：$(self_cmd) relay list"
+  fi
 }
 status() {
   echo "=== sing-box 版本 ==="
   if resolve_sb; then "$SB" version || true; else echo "未找到 sing-box 程序"; fi
-  echo "=== systemd 状态 ==="
-  systemctl --no-pager --full status "$SERVICE" || true
+  echo "=== 服务状态（${INIT_SYS}） ==="
+  svc_status
   echo "=== 端口监听 ==="
   ss -lntup || true
 }
@@ -767,6 +1287,7 @@ firewall_help() {
 本脚本不会自动修改防火墙。请仅放行你实际使用的节点端口：
   Reality / AnyTLS / Shadowsocks：TCP
   Hysteria2 / TUIC：UDP
+  端口转发：按添加时选择的 tcp / udp / both 放行
 
 检查本机规则：
   ufw status verbose
@@ -780,6 +1301,8 @@ firewall_help() {
   ufw allow 10443/tcp
   ufw allow 11443/tcp
 
+Alpine 通常没有 UFW，默认也不拦截入站；如果自己配置了 iptables / nftables，用上面的命令检查。
+
 同时检查 VPS 服务商后台的云防火墙/安全组。不要在 SSH 远程会话中盲目启用 UFW；
 先确认 SSH 端口已放行，避免失去连接。
 TXT
@@ -790,12 +1313,19 @@ singbox-manager ${SCRIPT_VERSION}
 用法：$(self_cmd) [命令]
 
   （不带命令）     打开管理菜单
-  install          安装依赖、sing-box、systemd 服务和 sb 快捷命令
+  install          安装依赖、sing-box、系统服务（systemd 或 OpenRC）和 sb 快捷命令
   menu             打开管理菜单
   links            查看所有节点的参数和分享链接
   host             修改服务器地址（自动识别公网 IP），并重新生成分享链接
+  relay            中转 / 端口转发菜单
+  relay add        添加中转（本机入口 → 落地节点）
+  relay forward    添加端口转发（TCP/UDP → 目标地址:端口）
+  relay list       查看中转/转发和分享链接
+  relay del [名称] 删除中转/转发
   check            校验 sing-box 配置
   status           查看版本、服务状态和监听端口
+  restart          重启 sing-box
+  log [行数]       查看 sing-box 日志（默认最后 100 行）
   firewall         查看防火墙放行说明
   update           从 GitHub 下载最新版脚本并更新 sb
   shortcut         创建或刷新 sb 快捷命令
@@ -822,8 +1352,9 @@ menu() {
     echo "13) 防火墙检查说明"
     echo "14) 修改服务器地址（重新生成分享链接）"
     echo "15) 更新脚本"
+    echo "16) 中转 / 端口转发"
     echo "0) 退出"
-    read -r -p "选择 [0-15]: " choice || exit 0
+    read -r -p "选择 [0-16]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -834,12 +1365,13 @@ menu() {
       7) show_links ;;
       8) remove_node ;;
       9) check_config ;;
-      10) systemctl restart "$SERVICE" ;;
+      10) svc_restart && echo "已重启 sing-box。" ;;
       11) status ;;
-      12) journalctl -u "$SERVICE" -n 100 --no-pager ;;
+      12) svc_logs 100 ;;
       13) firewall_help ;;
-      14) cmd_set_host ;;
+      14) cmd_set_host; compgen -G "$RELAY_DIR/*.json" >/dev/null && relay_list ;;
       15) cmd_update; echo "请重新运行 sb 以使用新版本。"; exit 0 ;;
+      16) relay_menu ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -847,18 +1379,32 @@ menu() {
   done
 }
 need_jq() { have jq || die "缺少 jq。先运行：$(self_cmd) install"; }
+prepare_manage() {
+  need_jq
+  check_no_conflicts
+  need_sb
+  init_config
+  if (( SAMPLE_REMOVED || LEFTOVER_SVC )); then
+    check_config && reload_service
+    (( LEFTOVER_SVC )) && echo "已写入本脚本的 sing-box 服务文件并重启服务。"
+  fi
+  [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] || install_shortcut
+}
 main() {
   case "${1:-menu}" in
     -h|--help|help) usage; exit 0 ;;
     version|-v|--version) echo "singbox-manager ${SCRIPT_VERSION}"; exit 0 ;;
   esac
   need_root
+  detect_init
   case "${1:-menu}" in
     install)
       [[ -r /etc/os-release ]] || die "无法识别系统"
       . /etc/os-release
-      [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] || die "此安装器目前面向 Debian/Ubuntu 系"
+      [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* || "${ID:-}" == "alpine" ]] || die "此安装器目前支持 Debian/Ubuntu 系和 Alpine"
       install_deps
+      detect_init
+      need_init
       check_no_conflicts      # 有其他 sing-box 脚本时，在安装任何东西之前停下
       install_singbox
       init_config
@@ -872,19 +1418,23 @@ main() {
       fi
       alias_notice
       ;;
-    menu)
-      need_jq
-      check_no_conflicts
-      need_sb
-      init_config
-      if (( SAMPLE_REMOVED )); then check_config && reload_service; fi
-      [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] || install_shortcut
-      menu
-      ;;
+    menu) prepare_manage; menu ;;
+    relay)
+      prepare_manage
+      case "${2:-menu}" in
+        menu) relay_menu ;;
+        add) relay_add ;;
+        forward|fwd) forward_add ;;
+        list|ls) relay_list ;;
+        del|rm|remove) relay_remove "${3:-}" ;;
+        *) usage; exit 2 ;;
+      esac ;;
     links) need_jq; show_links ;;
-    host) need_jq; cmd_set_host ;;
+    host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
     status) status ;;
+    restart) need_sb; svc_restart && echo "已重启 sing-box。" ;;
+    log|logs) svc_logs "${2:-100}" ;;
     firewall) firewall_help ;;
     update) cmd_update ;;
     shortcut) install_shortcut ;;
