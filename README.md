@@ -56,8 +56,10 @@ sb
 | 3 | TUIC | UDP | 9443 | 拥塞控制 `bbr`，ALPN `h3`，使用自签证书 |
 | 4 | AnyTLS | TCP | 10443 | 使用自签证书；可选多个 TLS 指纹 |
 | 5 | Shadowsocks | TCP | 11443 | 支持 `aes-128-gcm`（默认）、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm` |
+| 6 | Telegram SOCKS5 | TCP | 1080 | sing-box SOCKS5 入站，自动生成用户名和密码；**不支持 MTProto** |
 
 UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里没有写死任何密码。
+Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提供兼容的 SOCKS5，不会把它称作 MTProto。
 
 ## 管理菜单
 
@@ -68,30 +70,44 @@ UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里�
 3) 添加 TUIC
 4) 添加 AnyTLS
 5) 添加 Shadowsocks
-6) 查看节点
-7) 查看节点参数/分享链接
-8) 删除节点
-9) 校验配置
-10) 重启服务
-11) 查看状态/监听端口
-12) 查看日志
-13) 防火墙检查说明
-14) 修改服务器地址（重新生成分享链接）
-15) 更新脚本
-16) 中转 / 端口转发
-17) 修改节点 TLS 指纹（多指纹分享链接）
-18) 修改节点端口
+6) 添加 Telegram SOCKS5（不支持 MTProto）
+7) 查看节点
+8) 查看节点参数/分享链接
+9) 删除节点
+10) 校验配置
+11) 重启服务
+12) 查看状态/监听端口
+13) 查看日志
+14) 防火墙检查说明
+15) 修改服务器地址（重新生成分享链接）
+16) 更新脚本
+17) 中转 / 端口转发
+18) 修改节点 TLS 指纹（多指纹分享链接）
+19) 修改节点端口
 0) 退出
 ```
 
 ### 添加节点的流程
 
-- 选择协议（1-5），输入节点名称（只能用字母、数字、下划线、短横线，最长 40 个字符）和端口。脚本会检查端口是否已被占用。
+- 选择协议（1-6），输入节点名称（只能用字母、数字、下划线、短横线，最长 40 个字符）和端口。脚本会检查端口是否已被占用。
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
 - Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
 - Reality 需要填写 SNI / 握手域名；Hysteria2、TUIC、AnyTLS 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址）；Shadowsocks 需要选择加密方式。
+- Telegram SOCKS5 会生成随机用户名和密码，并在输出中给出 Telegram 手动配置所需的服务器、端口和凭据。
 - 脚本先备份当前配置，再写入新节点并用 `sing-box check` 校验。校验失败会自动恢复最近一次备份；通过则重启服务。
-- 屏幕上会显示节点参数和分享链接，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 7 或 `sb links` 再看。
+- 屏幕上会显示节点参数、分享链接或手动配置字段，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 8 或 `sb links` 再看。
+
+### Telegram 内置代理（SOCKS5）
+
+添加节点：
+
+```bash
+sb tg
+```
+
+Telegram 手机端通常在“设置 → 数据和存储 → 代理设置 → 添加代理 → SOCKS5”中填写管理器显示的服务器地址、端口、用户名和密码；不同 Telegram 客户端的菜单位置可能略有区别。请在防火墙和云安全组中放行该节点的 TCP 端口（默认 `1080/tcp`）。脚本不会自动开放端口。
+
+此功能是 sing-box 的 SOCKS5 服务端，不是 Telegram 的 MTProto 代理；若你需要 MTProto，本脚本当前无法创建该类型节点。SOCKS5 凭据可使用于其他支持 SOCKS5 的客户端，也应按敏感信息保管。
 
 ### 服务器地址
 
@@ -262,6 +278,7 @@ sb relay del
 | 命令 | 作用 |
 | --- | --- |
 | `sb` | 打开管理菜单 |
+| `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
 | `sb links` | 查看所有节点的参数和分享链接 |
 | `sb host` | 修改服务器地址并重新生成分享链接 |
 | `sb relay` | 中转 / 端口转发菜单 |
@@ -381,7 +398,7 @@ systemctl disable --now caddy
 
 脚本**不会**自动修改防火墙，你需要只放行实际使用的端口：
 
-- Reality / AnyTLS / Shadowsocks：TCP
+- Reality / AnyTLS / Shadowsocks / Telegram SOCKS5：TCP
 - Hysteria2 / TUIC：UDP
 - 端口转发：按添加时选择的 `tcp` / `udp` / `both` 放行
 
@@ -393,6 +410,7 @@ ufw allow 8443/udp
 ufw allow 9443/udp
 ufw allow 10443/tcp
 ufw allow 11443/tcp
+ufw allow 1080/tcp
 ```
 
 Alpine 通常没有 UFW，默认也不拦截入站。如果你自己配置了 iptables / nftables，可以用下面的命令查看现有规则：

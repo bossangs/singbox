@@ -2,14 +2,14 @@
 # @bossangs-singbox-manager
 # singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu (systemd) and Alpine (OpenRC)
 # https://github.com/bossangs/singbox
-# Supports VLESS + Reality, Hysteria2, TUIC, AnyTLS, Shadowsocks, relays and port forwarding.
+# Supports VLESS + Reality, Hysteria2, TUIC, AnyTLS, Shadowsocks, Telegram SOCKS5, relays and port forwarding.
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
 # If another sing-box one-click script is detected, nothing is changed; cleanup steps are printed instead.
 
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.24.1"
+SCRIPT_VERSION="2026.10.28.1"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -852,7 +852,8 @@ apply_json() {
   [[ -n "$out" ]] || out=null
   EXPECT_PORT="$(jq -r '.listen_port' <<<"$obj")"
   EXPECT_NET="$(jq -r 'if .type == "hysteria2" or .type == "tuic" then "udp"
-    elif .type == "shadowsocks" or .type == "direct" then (.network // "both") else "tcp" end' <<<"$obj")"
+    elif .type == "shadowsocks" or .type == "direct" then (.network // "both")
+    elif .type == "socks" then "tcp" else "tcp" end' <<<"$obj")"
   commit_jq --argjson obj "$obj" --argjson out "$out" --arg to "$RULE_TO" '
     .inbounds += [$obj]
     | .route = (.route // {})
@@ -929,6 +930,12 @@ print_link() {
       userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 -w0)"
       echo "分享链接："
       jq -r --arg h "$h" --arg u "$userinfo" '"ss://\($u)@\($h):\(.port)#\(.tag)"' "$f" ;;
+    "Telegram SOCKS5")
+      echo "Telegram 内置代理手动填写（SOCKS5；此节点不支持 MTProto）："
+      jq -r '"服务器：\(.server)\n端口：\(.port)\n用户名：\(.username)\n密码：\(.password)"' "$f"
+      echo "Telegram 路径：设置 → 数据和存储 → 代理设置 → 添加代理 → SOCKS5。"
+      echo "请只把凭据提供给信任的设备/用户；本脚本不会自动修改防火墙。"
+      ;;
     *) echo "（未知协议 $proto，无法生成分享链接）" ;;
   esac
 }
@@ -1105,6 +1112,22 @@ add_ss() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg method "$method" --arg password "$password" \
     '{protocol:"Shadowsocks",tag:$tag,server:$host,port:$port,method:$method,password:$password}')"
+}
+
+add_telegram_socks() {
+  local tag port username password obj host
+  ask_tag tag tg-socks5
+  prompt port "TCP 端口" "$(free_port 1080 tcp)"
+  check_port "$port" tcp
+  port="$((10#$port))"
+  host="$(public_host)"
+  username="$(openssl rand -hex 6)"
+  password="$(openssl rand -hex 18)"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg username "$username" --arg password "$password" \
+    '{type:"socks",tag:$tag,listen:"::",listen_port:$port,users:[{username:$username,password:$password}]}')"
+  apply_json "$obj"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg username "$username" --arg password "$password" \
+    '{protocol:"Telegram SOCKS5",tag:$tag,server:$host,port:$port,username:$username,password:$password}')"
 }
 
 # ---------- 中转：解析落地节点分享链接 ----------
@@ -1507,6 +1530,7 @@ inbound_net() {
     if .type == "hysteria2" or .type == "tuic" then "udp"
     elif .type == "shadowsocks" then (.network // "both")
     elif .type == "direct" then (.network // "both")
+    elif .type == "socks" then "tcp"
     else "tcp" end' "$CONF"
 }
 net_label() { case "$1" in tcp) echo TCP ;; udp) echo UDP ;; *) echo "TCP 和 UDP" ;; esac; }
@@ -1669,7 +1693,7 @@ status() {
 firewall_help() {
   cat <<'TXT'
 本脚本不会自动修改防火墙。请仅放行你实际使用的节点端口：
-  Reality / AnyTLS / Shadowsocks：TCP
+  Reality / AnyTLS / Shadowsocks / Telegram SOCKS5：TCP
   Hysteria2 / TUIC：UDP
   端口转发：按添加时选择的 tcp / udp / both 放行
 
@@ -1684,6 +1708,7 @@ firewall_help() {
   ufw allow 9443/udp
   ufw allow 10443/tcp
   ufw allow 11443/tcp
+  ufw allow 1080/tcp  # Telegram SOCKS5 默认端口
 
 Alpine 通常没有 UFW，默认也不拦截入站；如果自己配置了 iptables / nftables，用上面的命令检查。
 
@@ -1699,6 +1724,7 @@ singbox-manager ${SCRIPT_VERSION}
   （不带命令）     打开管理菜单
   install          安装依赖、sing-box、系统服务（systemd 或 OpenRC）和 sb 快捷命令
   menu             打开管理菜单
+  tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
   links            查看所有节点的参数和分享链接
   host             修改服务器地址（自动识别公网 IP），并重新生成分享链接
   relay            中转 / 端口转发菜单
@@ -1728,40 +1754,42 @@ menu() {
     echo "3) 添加 TUIC"
     echo "4) 添加 AnyTLS"
     echo "5) 添加 Shadowsocks"
-    echo "6) 查看节点"
-    echo "7) 查看节点参数/分享链接"
-    echo "8) 删除节点"
-    echo "9) 校验配置"
-    echo "10) 重启服务"
-    echo "11) 查看状态/监听端口"
-    echo "12) 查看日志"
-    echo "13) 防火墙检查说明"
-    echo "14) 修改服务器地址（重新生成分享链接）"
-    echo "15) 更新脚本"
-    echo "16) 中转 / 端口转发"
-    echo "17) 修改节点 TLS 指纹（多指纹分享链接）"
-    echo "18) 修改节点端口"
+    echo "6) 添加 Telegram SOCKS5（不支持 MTProto）"
+    echo "7) 查看节点"
+    echo "8) 查看节点参数/分享链接"
+    echo "9) 删除节点"
+    echo "10) 校验配置"
+    echo "11) 重启服务"
+    echo "12) 查看状态/监听端口"
+    echo "13) 查看日志"
+    echo "14) 防火墙检查说明"
+    echo "15) 修改服务器地址（重新生成分享链接）"
+    echo "16) 更新脚本"
+    echo "17) 中转 / 端口转发"
+    echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
+    echo "19) 修改节点端口"
     echo "0) 退出"
-    read -r -p "选择 [0-18]: " choice || exit 0
+    read -r -p "选择 [0-19]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
       3) add_tuic ;;
       4) add_anytls ;;
       5) add_ss ;;
-      6) list_nodes ;;
-      7) show_links ;;
-      8) remove_node ;;
-      9) check_config ;;
-      10) svc_restart && echo "已重启 sing-box。" ;;
-      11) status ;;
-      12) svc_logs 100 ;;
-      13) firewall_help ;;
-      14) cmd_set_host; compgen -G "$RELAY_DIR/*.json" >/dev/null && relay_list ;;
-      15) cmd_update; echo "请重新运行 sb 以使用新版本。"; exit 0 ;;
-      16) relay_menu ;;
-      17) cmd_fp ;;
-      18) cmd_port ;;
+      6) add_telegram_socks ;;
+      7) list_nodes ;;
+      8) show_links ;;
+      9) remove_node ;;
+      10) check_config ;;
+      11) svc_restart && echo "已重启 sing-box。" ;;
+      12) status ;;
+      13) svc_logs 100 ;;
+      14) firewall_help ;;
+      15) cmd_set_host; compgen -G "$RELAY_DIR/*.json" >/dev/null && relay_list ;;
+      16) cmd_update; echo "请重新运行 sb 以使用新版本。"; exit 0 ;;
+      17) relay_menu ;;
+      18) cmd_fp ;;
+      19) cmd_port ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1819,6 +1847,7 @@ main() {
         del|rm|remove) relay_remove "${3:-}" ;;
         *) usage; exit 2 ;;
       esac ;;
+    tg|telegram|socks5) prepare_manage; add_telegram_socks ;;
     fp|fingerprint) need_jq; cmd_fp "${2:-}" "${*:3}" ;;
     port) prepare_manage; cmd_port "${2:-}" "${3:-}" ;;
     links) need_jq; show_links ;;
