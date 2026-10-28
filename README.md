@@ -93,7 +93,7 @@ Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
 - Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
 - Reality 需要填写 SNI / 握手域名；Hysteria2、TUIC、AnyTLS 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址）；Shadowsocks 需要选择加密方式。
-- Telegram SOCKS5 会生成随机用户名和密码，并在输出中给出 Telegram 手动配置所需的服务器、端口和凭据。
+- Telegram SOCKS5 会生成随机用户名和密码，并输出 Telegram 官方 `https://t.me/socks?...` 与 `tg://socks?...` 一键添加链接，同时保留手动参数。
 - 脚本先备份当前配置，再写入新节点并用 `sing-box check` 校验。校验失败会自动恢复最近一次备份；通过则重启服务。
 - 屏幕上会显示节点参数、分享链接或手动配置字段，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 8 或 `sb links` 再看。
 
@@ -106,6 +106,10 @@ sb tg
 ```
 
 Telegram 手机端通常在“设置 → 数据和存储 → 代理设置 → 添加代理 → SOCKS5”中填写管理器显示的服务器地址、端口、用户名和密码；不同 Telegram 客户端的菜单位置可能略有区别。请在防火墙和云安全组中放行该节点的 TCP 端口（默认 `1080/tcp`）。脚本不会自动开放端口。
+
+添加节点后，终端会显示 `https://t.me/socks?...` 和 `tg://socks?...` 两种官方 SOCKS5 深链。之后运行 `sb links`，找到 Telegram SOCKS5 节点，点击 HTTPS 链接或复制到 Telegram 打开并确认添加；也可以使用 `tg://` 应用深链，或按下方字段手动填写。若终端没有自动识别为可点击链接，直接复制整行即可。
+
+两种一键链接都包含服务器地址和登录凭据；请像密码一样保管，不要公开粘贴或转发给不信任的人。参数已按 URL 编码，Telegram 打开链接后会自动解析。
 
 此功能是 sing-box 的 SOCKS5 服务端，不是 Telegram 的 MTProto 代理；若你需要 MTProto，本脚本当前无法创建该类型节点。SOCKS5 凭据可使用于其他支持 SOCKS5 的客户端，也应按敏感信息保管。
 

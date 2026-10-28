@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.28.1"
+SCRIPT_VERSION="2026.10.28.2"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -904,7 +904,7 @@ ask_tag() {
 # ---------- 分享链接 ----------
 print_link() {
   # 根据节点凭据文件生成分享链接（服务器地址取文件里的 server 字段）
-  local f="$1" proto h userinfo
+  local f="$1" proto h userinfo encoded_server encoded_user encoded_pass port https_link tg_link
   proto="$(jq -r '.protocol' "$f")"
   h="$(uri_host "$(jq -r '.server' "$f")")"
   case "$proto" in
@@ -931,7 +931,17 @@ print_link() {
       echo "分享链接："
       jq -r --arg h "$h" --arg u "$userinfo" '"ss://\($u)@\($h):\(.port)#\(.tag)"' "$f" ;;
     "Telegram SOCKS5")
-      echo "Telegram 内置代理手动填写（SOCKS5；此节点不支持 MTProto）："
+      encoded_server="$(urlencode "$(jq -r '.server' "$f")")"
+      port="$(jq -r '.port' "$f")"
+      encoded_user="$(urlencode "$(jq -r '.username' "$f")")"
+      encoded_pass="$(urlencode "$(jq -r '.password' "$f")")"
+      https_link="https://t.me/socks?server=$encoded_server&port=$port&user=$encoded_user&pass=$encoded_pass"
+      tg_link="tg://socks?server=$encoded_server&port=$port&user=$encoded_user&pass=$encoded_pass"
+      echo "Telegram SOCKS5 一键添加链接（点击或复制到 Telegram）："
+      printf '%s\n' "$https_link"
+      echo "Telegram 应用深链："
+      printf '%s\n' "$tg_link"
+      echo "手动配置参数（SOCKS5；此节点不支持 MTProto）："
       jq -r '"服务器：\(.server)\n端口：\(.port)\n用户名：\(.username)\n密码：\(.password)"' "$f"
       echo "Telegram 路径：设置 → 数据和存储 → 代理设置 → 添加代理 → SOCKS5。"
       echo "请只把凭据提供给信任的设备/用户；本脚本不会自动修改防火墙。"
