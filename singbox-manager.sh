@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.28.2"
+SCRIPT_VERSION="2026.10.28.3"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -892,6 +892,46 @@ next_tag() {
   while tag_exists "${base}-${n}"; do n=$((n + 1)); done
   printf '%s-%s' "$base" "$n"
 }
+clean_tag_fragment() {
+  # 将 sing-box tag 或服务器地址变成管理器允许的短标签片段
+  printf '%s' "$1" | LC_ALL=C sed -E 's/[^A-Za-z0-9_-]+/-/g; s/^-+//; s/-+$//'
+}
+telegram_local_tag() {
+  # 返回本地第一个可用的 sing-box 入站 tag 片段；本地没有合适名称时返回空。
+  local source
+  while IFS= read -r source; do
+    source="$(clean_tag_fragment "$source")"
+    [[ -n "$source" ]] || continue
+    printf '%s' "${source:0:27}"
+    return 0
+  done < <(jq -r '.inbounds[]? | .tag? | select(type == "string" and length > 0)' "$CONF")
+  return 1
+}
+telegram_auto_tag() {
+  # 优先从本机 sing-box 入站 tag 生成名称；没有可用 tag 时回退到服务器主机名/地址。
+  # 默认名在当前配置与凭据目录中自动避开重名；无本地 tag 时调用方可让用户自定义。
+  local server_host="${1:-}" source base fallback candidate suffix max_prefix n=1
+  source="$(telegram_local_tag || true)"
+  if [[ -n "$source" ]]; then
+    base="${source}-tg-socks5"
+  else
+    fallback="$server_host"
+    [[ -n "$fallback" ]] || fallback="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    fallback="$(clean_tag_fragment "$fallback")"
+    fallback="${fallback:0:25}"
+    base="tg-socks5-${fallback:-node}"
+  fi
+  while true; do
+    suffix="-$n"
+    max_prefix=$((40 - ${#suffix}))
+    candidate="${base:0:max_prefix}${suffix}"
+    if ! tag_exists "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    n=$((n + 1))
+  done
+}
 ask_tag() {
   # $1：变量名；$2：默认前缀
   local __t
@@ -1125,12 +1165,21 @@ add_ss() {
 }
 
 add_telegram_socks() {
-  local tag port username password obj host
-  ask_tag tag tg-socks5
+  local tag port username password obj host local_name
   prompt port "TCP 端口" "$(free_port 1080 tcp)"
   check_port "$port" tcp
   port="$((10#$port))"
   host="$(public_host)"
+  local_name="$(telegram_local_tag || true)"
+  tag="$(telegram_auto_tag "$host")"
+  if [[ -n "$local_name" ]]; then
+    echo "根据本地 sing-box 入站名称自动生成 Telegram SOCKS5 节点名：$tag"
+  else
+    prompt tag "节点名称（可选自定义；直接回车使用自动名称）" "$tag"
+    valid_tag "$tag"
+    tag_exists "$tag" && die "节点名称 $tag 已存在，请重新运行并输入其他名称"
+    echo "Telegram SOCKS5 节点名称：$tag"
+  fi
   username="$(openssl rand -hex 6)"
   password="$(openssl rand -hex 18)"
   obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg username "$username" --arg password "$password" \
