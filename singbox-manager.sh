@@ -9,14 +9,20 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.24.1"
+SCRIPT_VERSION="2026.10.28.1"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
+RAW_PANEL_URL="https://raw.githubusercontent.com/bossangs/singbox/main/panel.py"
 SHORTCUT="/usr/local/bin/sb"
 CONF_DIR="/etc/sing-box"
 CONF="$CONF_DIR/config.json"
 DATA="$CONF_DIR/manager"
 CERT_DIR="$CONF_DIR/certs"
+TUNNEL_DIR="$CONF_DIR/cloudflared"
+TUNNEL_TOKEN_FILE="$TUNNEL_DIR/token"
+TUNNEL_CONF="$DATA/cloudflare-tunnel.json"
+PANEL_INSTALL_DIR="/usr/local/lib/singbox-manager"
+PANEL_APP="$PANEL_INSTALL_DIR/panel.py"
 BACKUP_DIR="/var/backups/sing-box-manager"
 SERVICE="sing-box"
 # sing-box 官方 deb/rpm 包自带示例配置里的 Shadowsocks 密码（公开的，不能留在线上）
@@ -148,13 +154,22 @@ install_shortcut() {
   fi
 }
 cmd_update() {
-  local tmp new_ver
+  local tmp new_ver ptmp
   shortcut_is_foreign && die "$SHORTCUT 已被其他程序占用，未更新。"
   tmp="$(mktemp)"
   fetch_latest "$tmp"
   new_ver="$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n1)"
   install -m 755 "$tmp" "$SHORTCUT"
   rm -f "$tmp"
+  if [[ -f "$PANEL_APP" ]]; then
+    ptmp="$(mktemp)"
+    if curl -fsSL --max-time 30 "$RAW_PANEL_URL" -o "$ptmp" && python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$ptmp"; then
+      install -m 644 "$ptmp" "$PANEL_APP"
+      chown root:root "$PANEL_APP"
+      echo "已同步更新网页面板程序。"
+    else echo "提示：网页面板程序下载或语法检查失败，保留旧版本。" >&2; fi
+    rm -f "$ptmp"
+  fi
   echo "已更新 sb：${SCRIPT_VERSION} -> ${new_ver:-未知}。运行 sb 打开管理菜单。"
 }
 cmd_remove_shortcut() {
@@ -915,6 +930,9 @@ print_link() {
       fi
       jq -r --arg h "$h" '(.fps // [.fp // "chrome"]) as $fps | $fps[] as $fp
         | "vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=\($fp)&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
+    "VLESS + WS (Cloudflare Tunnel)")
+      echo "分享链接（Cloudflare Tunnel；边缘 TLS + WebSocket）："
+      jq -r --arg h "$h" '"vless://\(.uuid)@\($h):443?encryption=none&security=tls&sni=\(.sni|@uri)&type=ws&host=\(.host|@uri)&path=\(.path|@uri)#\(.tag)"' "$f" ;;
     Hysteria2)
       echo "分享链接（自签证书，客户端需允许不安全证书）："
       jq -r --arg h "$h" '"hysteria2://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
@@ -1105,6 +1123,395 @@ add_ss() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg method "$method" --arg password "$password" \
     '{protocol:"Shadowsocks",tag:$tag,server:$host,port:$port,method:$method,password:$password}')"
+}
+
+# ---------- Cloudflare Tunnel / 网页管理面板 ----------
+CF_SERVICE="singbox-cloudflared"
+PANEL_SERVICE="singbox-panel"
+PANEL_USER="singbox-panel"
+PANEL_GROUP="singbox-panel"
+PANEL_HELPER="/usr/local/libexec/singbox-panel-helper"
+PANEL_AUTH_DIR="/etc/singbox-panel"
+
+cf_value() { jq -r --arg k "$1" '.[$k] // empty' "$TUNNEL_CONF" 2>/dev/null || true; }
+install_cloudflared_binary() {
+  local arch asset tmp bin
+  if have cloudflared; then
+    bin="$(command -v cloudflared)"
+    "$bin" version >/dev/null 2>&1 && { printf '%s' "$bin"; return 0; }
+  fi
+  case "$(uname -m)" in
+    x86_64|amd64) asset=amd64 ;;
+    i386|i486|i586|i686|x86) asset=386 ;;
+    aarch64|arm64) asset=arm64 ;;
+    armv7*|armhf) asset=arm ;;
+    *) die "cloudflared 暂不支持此 CPU 架构：$(uname -m)" ;;
+  esac
+  tmp="$(mktemp)"
+  echo "正在下载 Cloudflare 官方 cloudflared Linux ${asset} 二进制……"
+  if ! curl -fL --retry 2 --connect-timeout 15 --max-time 180 \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${asset}" -o "$tmp"; then
+    rm -f "$tmp"; die "cloudflared 下载失败，请检查服务器能否访问 github.com"
+  fi
+  chmod 755 "$tmp"
+  if ! "$tmp" version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    if have apk && ! have apt-get; then
+      echo "官方二进制不能在本机运行，尝试 Alpine 软件源中的 cloudflared。"
+      apk add cloudflared || die "Alpine 软件源没有可用的 cloudflared；未修改 sing-box。"
+      bin="$(command -v cloudflared)"
+      "$bin" version >/dev/null 2>&1 || die "Alpine cloudflared 安装后无法运行。"
+      printf '%s' "$bin"; return 0
+    fi
+    die "下载的 cloudflared 二进制无法在本机运行。"
+  fi
+  install -m 755 "$tmp" /usr/local/bin/cloudflared
+  rm -f "$tmp"
+  printf '%s' /usr/local/bin/cloudflared
+}
+write_cf_service() {
+  local bin="$1"
+  mkdir -p "$TUNNEL_DIR" /var/log
+  chmod 700 "$TUNNEL_DIR"
+  touch /var/log/singbox-cloudflared.log
+  chmod 600 "$TUNNEL_TOKEN_FILE" /var/log/singbox-cloudflared.log
+  if [[ "$INIT_SYS" == systemd ]]; then
+    cat >"/etc/systemd/system/${CF_SERVICE}.service" <<UNIT
+[Unit]
+Description=Cloudflare Tunnel connector for sing-box manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=TUNNEL_TOKEN_FILE=${TUNNEL_TOKEN_FILE}
+ExecStart=${bin} tunnel --no-autoupdate run
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 644 "/etc/systemd/system/${CF_SERVICE}.service"
+    systemctl daemon-reload
+    systemctl enable "${CF_SERVICE}.service" >/dev/null
+    systemctl restart "${CF_SERVICE}.service"
+  elif is_openrc; then
+    cat >"/etc/conf.d/${CF_SERVICE}" <<CONF
+# Managed by singbox-manager
+TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE}"
+CONF
+    cat >"/etc/init.d/${CF_SERVICE}" <<RC
+#!/sbin/openrc-run
+${MARK}
+description="Cloudflare Tunnel connector for sing-box manager"
+supervisor="supervise-daemon"
+command="${bin}"
+command_args="tunnel --no-autoupdate run"
+output_log="/var/log/singbox-cloudflared.log"
+error_log="/var/log/singbox-cloudflared.log"
+respawn_delay=5
+
+: \${TUNNEL_TOKEN_FILE:=/etc/sing-box/cloudflared/token}
+export TUNNEL_TOKEN_FILE
+
+depend() {
+  need net
+  after firewall
+}
+RC
+    chmod 755 "/etc/init.d/${CF_SERVICE}"
+    rc-update add "$CF_SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$CF_SERVICE" restart >/dev/null 2>&1 || rc-service "$CF_SERVICE" start
+  else
+    die "未检测到 systemd 或 OpenRC，无法安装 cloudflared 服务。"
+  fi
+}
+write_panel_service() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    cat >/etc/systemd/system/${PANEL_SERVICE}.service <<UNIT
+[Unit]
+Description=Loopback-only sing-box web management panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${PANEL_USER}
+Group=${PANEL_GROUP}
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 ${PANEL_APP} --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 644 "/etc/systemd/system/${PANEL_SERVICE}.service"
+    systemctl daemon-reload
+    systemctl enable "${PANEL_SERVICE}.service" >/dev/null
+    systemctl restart "${PANEL_SERVICE}.service"
+  elif is_openrc; then
+    cat >"/etc/init.d/${PANEL_SERVICE}" <<RC
+#!/sbin/openrc-run
+${MARK}
+description="Loopback-only sing-box web management panel"
+supervisor="supervise-daemon"
+command="/usr/bin/python3"
+command_args="${PANEL_APP} --host 127.0.0.1 --port 8765"
+command_user="${PANEL_USER}:${PANEL_GROUP}"
+output_log="/var/log/singbox-panel.log"
+error_log="/var/log/singbox-panel.log"
+respawn_delay=3
+
+depend() {
+  need net
+}
+RC
+    chmod 755 "/etc/init.d/${PANEL_SERVICE}"
+    touch /var/log/singbox-panel.log
+    chown "${PANEL_USER}:${PANEL_GROUP}" /var/log/singbox-panel.log
+    chmod 600 /var/log/singbox-panel.log
+    rc-update add "$PANEL_SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$PANEL_SERVICE" restart >/dev/null 2>&1 || rc-service "$PANEL_SERVICE" start
+  else
+    die "未检测到 systemd 或 OpenRC，无法安装网页面板服务。"
+  fi
+}
+install_panel() {
+  local tmp password generated=0
+  if have apk && ! have apt-get; then apk add python3 sudo
+  else export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y python3 sudo; fi
+  mkdir -p "$PANEL_INSTALL_DIR" "$PANEL_AUTH_DIR" /usr/local/libexec /etc/sudoers.d
+  chmod 755 "$PANEL_INSTALL_DIR"
+  chown root:root "$PANEL_INSTALL_DIR"
+  chmod 750 "$PANEL_AUTH_DIR"
+  if have apk && ! have apt-get; then
+    getent group "$PANEL_GROUP" >/dev/null 2>&1 || addgroup -S "$PANEL_GROUP"
+    id "$PANEL_USER" >/dev/null 2>&1 || adduser -S -D -H -G "$PANEL_GROUP" -s /sbin/nologin "$PANEL_USER"
+  else
+    getent group "$PANEL_GROUP" >/dev/null 2>&1 || groupadd --system "$PANEL_GROUP"
+    id "$PANEL_USER" >/dev/null 2>&1 || useradd --system --no-create-home --gid "$PANEL_GROUP" --shell /usr/sbin/nologin "$PANEL_USER"
+  fi
+  tmp="$(mktemp)"
+  curl -fsSL --max-time 30 "$RAW_PANEL_URL" -o "$tmp" || { rm -f "$tmp"; die "下载 panel.py 失败：$RAW_PANEL_URL"; }
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" || { rm -f "$tmp"; die "下载的 panel.py 语法检查失败，未安装。"; }
+  install -m 644 "$tmp" "$PANEL_APP"
+  rm -f "$tmp"
+  cat >"$PANEL_HELPER" <<'HELPER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+valid_tag() { [[ "${1:-}" =~ ^[A-Za-z0-9_-]{1,40}$ ]]; }
+case "${1:-}" in
+  data) [[ $# -eq 1 ]] || exit 2; exec /usr/local/bin/sb panel-data ;;
+  restart) [[ $# -eq 1 ]] || exit 2; exec /usr/local/bin/sb restart ;;
+  logout) [[ $# -eq 1 ]] || exit 2; exec /usr/local/bin/sb panel-revoke ;;
+  add-ws) [[ $# -eq 1 ]] || exit 2; exec /usr/local/bin/sb panel-add-ws ;;
+  delete) [[ $# -eq 2 ]] && valid_tag "$2" || exit 2; exec /usr/local/bin/sb panel-delete "$2" ;;
+  *) echo "拒绝未授权的面板操作。" >&2; exit 2 ;;
+esac
+HELPER
+  chmod 755 "$PANEL_HELPER"
+  chown root:root "$PANEL_HELPER"
+  printf '%s\n' "${PANEL_USER} ALL=(root) NOPASSWD: ${PANEL_HELPER}" >"/etc/sudoers.d/singbox-panel"
+  chmod 440 /etc/sudoers.d/singbox-panel
+  visudo -cf /etc/sudoers.d/singbox-panel >/dev/null || die "面板 sudoers 规则检查失败，未启动面板。"
+  if [[ ! -s "$PANEL_AUTH_DIR/auth.json" ]]; then
+    password="$(openssl rand -base64 30 | tr -d '\n')"
+    printf '%s\n' "$password" | python3 "$PANEL_APP" --set-password || die "生成面板口令失败。"
+    generated=1
+  fi
+  if [[ ! -s "$PANEL_AUTH_DIR/session.key" ]]; then openssl rand 32 >"$PANEL_AUTH_DIR/session.key"; fi
+  chown -R "root:${PANEL_GROUP}" "$PANEL_AUTH_DIR"
+  chmod 750 "$PANEL_AUTH_DIR"
+  chmod 640 "$PANEL_AUTH_DIR/auth.json" "$PANEL_AUTH_DIR/session.key"
+  chown root:root "$PANEL_APP"
+  shortcut_is_foreign && die "$SHORTCUT 已被其他程序占用，面板 helper 无法安全调用本脚本。"
+  install_shortcut
+  if (( generated )); then echo "面板登录口令（仅显示这一次，请立即保存）：$password"; fi
+  write_panel_service
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl is-active --quiet "${PANEL_SERVICE}.service" || die "面板服务没有正常启动，请查看：journalctl -u ${PANEL_SERVICE} -n 80 --no-pager"
+  else rc-service "$PANEL_SERVICE" status >/dev/null 2>&1 || die "面板服务没有正常启动，请查看 /var/log/singbox-panel.log"; fi
+  echo "网页面板已启动，仅监听 127.0.0.1:8765。"
+  local phost; phost="$(cf_value panel_host)"
+  if [[ -n "$phost" ]]; then echo "Cloudflare Tunnel 面板路由应为：${phost} → http://127.0.0.1:8765"; else echo "尚未配置 Cloudflare Tunnel 域名；运行 sb tunnel setup 配置。"; fi
+  echo "强烈建议在 Cloudflare Zero Trust 中为面板 hostname 再启用 Access 策略。"
+}
+revoke_panel_sessions() {
+  [[ -s "$PANEL_AUTH_DIR/session.key" ]] || die "面板会话密钥不存在。"
+  openssl rand 32 >"$PANEL_AUTH_DIR/session.key.tmp"
+  install -m 640 "$PANEL_AUTH_DIR/session.key.tmp" "$PANEL_AUTH_DIR/session.key"; rm -f "$PANEL_AUTH_DIR/session.key.tmp"
+  chown "root:${PANEL_GROUP}" "$PANEL_AUTH_DIR/session.key"
+  echo "已撤销所有网页面板登录会话。"
+}
+reset_panel_password() {
+  local password
+  [[ -f "$PANEL_APP" ]] || die "网页面板尚未安装，请先运行：$(self_cmd) panel install"
+  password="$(openssl rand -base64 30 | tr -d '\n')"
+  printf '%s\n' "$password" | python3 "$PANEL_APP" --set-password || die "重置面板口令失败。"
+  openssl rand 32 >"$PANEL_AUTH_DIR/session.key.tmp"
+  install -m 640 "$PANEL_AUTH_DIR/session.key.tmp" "$PANEL_AUTH_DIR/session.key"; rm -f "$PANEL_AUTH_DIR/session.key.tmp"
+  chown "root:${PANEL_GROUP}" "$PANEL_AUTH_DIR/auth.json" "$PANEL_AUTH_DIR/session.key"
+  echo "已重置面板登录口令（仅显示这一次，请立即保存）；旧登录会话已失效。"
+}
+add_tunnel_ws() {
+  local host port tag uuid path obj node
+  [[ -s "$TUNNEL_CONF" ]] || die "还没有配置 Cloudflare Tunnel。先运行：$(self_cmd) tunnel setup"
+  host="$(cf_value node_host)"; port="$(cf_value ws_port)"
+  valid_domain "$host" || die "Tunnel 节点域名无效，请重新运行 tunnel setup。"
+  valid_port "$port" || die "Tunnel 本地端口无效，请重新运行 tunnel setup。"
+  if jq -e '.inbounds[]? | select(.tag | startswith("cf-ws-"))' "$CONF" >/dev/null 2>&1; then
+    die "已存在 Cloudflare Tunnel VLESS/WS 节点。先在面板中删除旧节点，再创建新的节点。"
+  fi
+  tag="$(next_tag cf-ws)"
+  check_port "$port" tcp
+  uuid="$(new_uuid)"
+  path="/ws-$(random_hex 12)"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
+    '{type:"vless",tag:$tag,listen:"127.0.0.1",listen_port:$port,users:[{uuid:$uuid}],transport:{type:"ws",path:$path}}')"
+  apply_json "$obj"
+  node="$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg host "$host" --arg path "$path" --argjson port "$port" \
+    '{protocol:"VLESS + WS (Cloudflare Tunnel)",tag:$tag,server:$host,port:443,uuid:$uuid,security:"tls",sni:$host,host:$host,path:$path,type:"ws",local_port:$port,server_mode:"tunnel"}')"
+  save_node "$tag" "$node"
+  echo
+  echo "Tunnel 节点已添加。Cloudflare Published application route 必须为：${host} → http://127.0.0.1:${port}"
+  echo "此端口只监听本机，无需在 VPS 防火墙或云安全组开放。"
+}
+panel_data() {
+  local service="stopped" panel_host="" node_host="" ws_port="" nodes="[]" f tag proto port links row
+  svc_is_running && service="running"
+  if [[ -s "$TUNNEL_CONF" ]]; then
+    panel_host="$(cf_value panel_host)"; node_host="$(cf_value node_host)"; ws_port="$(cf_value ws_port)"
+  fi
+  shopt -s nullglob
+  local files=("$DATA"/*.json)
+  shopt -u nullglob
+  for f in "${files[@]}"; do
+    jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 || continue
+    tag="$(jq -r '.tag' "$f")"; proto="$(jq -r '.protocol' "$f")"; port="$(jq -r '.port // .listen_port // "-"' "$f")"
+    links="$(print_link "$f" 2>/dev/null | grep -E '^(vless|hysteria2|tuic|anytls|ss)://' || true)"
+    row="$(jq -nc --arg tag "$tag" --arg protocol "$proto" --arg port "$port" --arg links "$links" '{tag:$tag,protocol:$protocol,port:$port,links:$links}')"
+    nodes="$(jq -nc --argjson a "$nodes" --argjson b "$row" '$a + [$b]')"
+  done
+  jq -nc --arg service "$service" --arg panel_host "$panel_host" --arg node_host "$node_host" --arg ws_port "$ws_port" --argjson nodes "$nodes" \
+    '{service:$service,panel_host:$panel_host,node_host:$node_host,ws_port:$ws_port,nodes:$nodes}'
+}
+install_cf_setup() {
+  local bin token panel_host node_host ws_port current_panel current_node existing_ws
+  bin="$(install_cloudflared_binary)"
+  current_panel="$(cf_value panel_host)"; current_node="$(cf_value node_host)"
+  echo "请先在 Cloudflare Zero Trust → Networking → Tunnels 创建远程管理 Tunnel，并准备它的 token。"
+  echo "此向导不会读取 Cloudflare API，也不会自动创建 DNS/Published application routes。"
+  prompt panel_host "面板域名（例如 panel.example.com）" "$current_panel"
+  valid_domain "$panel_host" || die "面板域名格式无效"
+  prompt node_host "VLESS WS 节点域名（例如 node.example.com）" "$current_node"
+  valid_domain "$node_host" || die "节点域名格式无效"
+  existing_ws="$(jq -r '.inbounds[]? | select(.tag | startswith("cf-ws-")) | .tag' "$CONF" | head -n1)"
+  if [[ -n "$existing_ws" && -n "$current_node" && "$node_host" != "$current_node" ]]; then
+    die "当前存在 Tunnel 节点 $existing_ws；删除该节点后才能更换节点域名，以免分享链接和 Cloudflare route 不一致。"
+  fi
+  if [[ -n "$existing_ws" ]]; then
+    ws_port="$(jq -r --arg t "$existing_ws" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONF")"
+  else
+    ws_port="$(cf_value ws_port)"
+    if ! valid_port "$ws_port" || ! port_free "$ws_port" tcp || port_in_config "$ws_port"; then ws_port="$(free_port 2053 tcp)"; fi
+    if ! valid_port "$ws_port" || ! port_free "$ws_port" tcp || port_in_config "$ws_port"; then die "找不到可用于 Tunnel WS 的本机 TCP 端口。"; fi
+  fi
+  echo "Cloudflare Tunnel token 将隐藏输入并以 root-only 文件保存，不会放进服务命令行或日志。"
+  read -r -s -p "粘贴 Tunnel token: " token || token=""
+  echo
+  [[ ${#token} -ge 30 && ${#token} -le 4096 ]] || die "Tunnel token 看起来不完整（长度需至少 30 个字符）。"
+  mkdir -p "$TUNNEL_DIR" "$DATA"
+  printf '%s' "$token" >"${TUNNEL_TOKEN_FILE}.tmp"
+  unset token
+  install -m 600 "${TUNNEL_TOKEN_FILE}.tmp" "$TUNNEL_TOKEN_FILE"; rm -f "${TUNNEL_TOKEN_FILE}.tmp"
+  jq -n --arg panel_host "$panel_host" --arg node_host "$node_host" --argjson ws_port "$ws_port" \
+    '{panel_host:$panel_host,node_host:$node_host,ws_port:$ws_port}' >"${TUNNEL_CONF}.tmp"
+  install -m 600 "${TUNNEL_CONF}.tmp" "$TUNNEL_CONF"; rm -f "${TUNNEL_CONF}.tmp"
+  write_cf_service "$bin"
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl is-active --quiet "${CF_SERVICE}.service" || die "cloudflared 没有正常启动，请查看：journalctl -u ${CF_SERVICE} -n 80 --no-pager"
+  else rc-service "$CF_SERVICE" status >/dev/null 2>&1 || die "cloudflared 没有正常启动，请查看 /var/log/singbox-cloudflared.log"; fi
+  install_panel
+  echo
+  echo "请在该 Tunnel 的 Cloudflare 控制台添加两条 Published application route："
+  echo "  ${panel_host} → http://127.0.0.1:8765"
+  echo "  ${node_host} → http://127.0.0.1:${ws_port}"
+  echo "并为面板域名单独启用 Cloudflare Access。面板口令与 Tunnel token 不同。"
+  echo "节点域名走 VLESS + WebSocket + TLS；此方案不承载 Reality、原始 TCP 或 UDP。"
+}
+tunnel_status() {
+  local phost nhost port
+  echo "=== cloudflared ==="
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl --no-pager --full status "${CF_SERVICE}.service" 2>&1 | sed -n '1,12p' || true
+  elif is_openrc; then rc-service "$CF_SERVICE" status 2>&1 || true
+  else echo "未检测到服务管理器"; fi
+  if [[ -s "$TUNNEL_CONF" ]]; then
+    phost="$(cf_value panel_host)"; nhost="$(cf_value node_host)"; port="$(cf_value ws_port)"
+    echo "=== Cloudflare 控制台需配置的路由 ==="
+    echo "${phost} → http://127.0.0.1:8765"
+    echo "${nhost} → http://127.0.0.1:${port}"
+    echo "Tunnel token：已保存（不显示）"
+  else echo "尚未完成 tunnel setup。"; fi
+  echo "=== 最近 cloudflared 日志 ==="
+  if is_openrc; then tail -n 30 /var/log/singbox-cloudflared.log 2>/dev/null || true
+  else journalctl -u "${CF_SERVICE}.service" -n 30 --no-pager 2>/dev/null || true; fi
+}
+tunnel_service_action() {
+  local action="$1"
+  [[ -s "$TUNNEL_TOKEN_FILE" ]] || die "没有本地 Tunnel token；先运行：$(self_cmd) tunnel setup"
+  if [[ "$INIT_SYS" == systemd ]]; then
+    case "$action" in start) systemctl start "${CF_SERVICE}.service" ;; stop) systemctl stop "${CF_SERVICE}.service" ;; restart) systemctl restart "${CF_SERVICE}.service" ;; esac
+  else rc-service "$CF_SERVICE" "$action"; fi
+}
+remove_local_tunnel() {
+  echo "只会删除本机 cloudflared 服务和 token；Cloudflare 控制台里的 Tunnel、DNS 与 Access 不会被删除。"
+  read -r -p "确认删除本机 Tunnel 配置？输入 yes: " answer || answer=""
+  [[ "$answer" == yes ]] || { echo "已取消。"; return 0; }
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl disable --now "${CF_SERVICE}.service" >/dev/null 2>&1 || true; rm -f "/etc/systemd/system/${CF_SERVICE}.service"; systemctl daemon-reload
+  else rc-service "$CF_SERVICE" stop >/dev/null 2>&1 || true; rc-update del "$CF_SERVICE" default >/dev/null 2>&1 || true; rm -f "/etc/init.d/${CF_SERVICE}" "/etc/conf.d/${CF_SERVICE}"; fi
+  rm -f "$TUNNEL_TOKEN_FILE" "$TUNNEL_CONF"
+  echo "本机 Tunnel 已移除；sing-box 节点和网页面板未删除。"
+}
+tunnel_menu() {
+  local c
+  echo "========== Cloudflare Tunnel =========="
+  echo "1) 配置/更新 Tunnel token、路由域名并启动面板"
+  echo "2) 查看 Tunnel 状态与路由映射"
+  echo "3) 重启 cloudflared"
+  echo "4) 停止 cloudflared"
+  echo "5) 删除本机 Tunnel 配置（Cloudflare 远端资源保留）"
+  echo "0) 返回"
+  read -r -p "选择 [0-5]: " c || return 0
+  case "$c" in
+    1) install_cf_setup ;;
+    2) tunnel_status ;;
+    3) tunnel_service_action restart ;;
+    4) tunnel_service_action stop ;;
+    5) remove_local_tunnel ;;
+    0) return 0 ;;
+    *) echo "无效选项" ;;
+  esac
+}
+panel_status() {
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl --no-pager --full status "${PANEL_SERVICE}.service" 2>&1 | sed -n '1,12p' || true
+  elif is_openrc; then rc-service "$PANEL_SERVICE" status 2>&1 || true
+  else echo "未检测到服务管理器"; fi
+  echo "本机监听检查："
+  ss -H -lnt '( sport = :8765 )' 2>/dev/null || true
+  echo "面板只应监听 127.0.0.1:8765。"
+}
+panel_service_action() {
+  local action="$1"
+  [[ -f "$PANEL_APP" ]] || die "网页面板尚未安装，请先运行：$(self_cmd) panel install"
+  if [[ "$INIT_SYS" == systemd ]]; then systemctl "$action" "${PANEL_SERVICE}.service"
+  else rc-service "$PANEL_SERVICE" "$action"; fi
 }
 
 # ---------- 中转：解析落地节点分享链接 ----------
@@ -1431,6 +1838,9 @@ fp_overview() {
   shopt -s nullglob
   local files=("$DATA"/*.json)
   shopt -u nullglob
+  local filtered=() f
+  for f in "${files[@]}"; do jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 && filtered+=("$f"); done
+  files=("${filtered[@]}")
   ((${#files[@]})) || { echo "还没有节点。"; return 0; }
   printf '%-24s %-18s %s\n' "名称" "协议" "指纹"
   for f in "${files[@]}"; do
@@ -1488,7 +1898,13 @@ cmd_fp() {
     esac
   fi
   tmp="$node.tmp"
-  jq --argjson fps "$(fps_json "$new")" --arg h "$(public_host)" '.server = $h | del(.fp) | .fps = $fps' "$node" >"$tmp" && install -m 600 "$tmp" "$node"
+  local current_host
+  current_host="$(jq -r '.server_mode // empty' "$node")"
+  if [[ "$current_host" == tunnel ]]; then
+    jq --argjson fps "$(fps_json "$new")" 'del(.fp) | .fps = $fps' "$node" >"$tmp" && install -m 600 "$tmp" "$node"
+  else
+    jq --argjson fps "$(fps_json "$new")" --arg h "$(public_host)" '.server = $h | del(.fp) | .fps = $fps' "$node" >"$tmp" && install -m 600 "$tmp" "$node"
+  fi
   rm -f "$tmp"
   if [[ "$new" == "$cur" ]]; then
     echo "指纹没有变化：$new"
@@ -1534,6 +1950,9 @@ cmd_port() {
   meta="$RELAY_DIR/$tag.json"
   [[ -f "$meta" && "$(jq -r .kind "$meta")" == forward ]] && is_fwd=1
   (( is_fwd )) || [[ -f "$DATA/$tag.json" ]] || die "找不到 $tag 的凭据文件 $DATA/$tag.json，无法重新生成分享链接"
+  if [[ "$(jq -r '.server_mode // empty' "$DATA/$tag.json" 2>/dev/null || true)" == tunnel ]]; then
+    die "$tag 是 Cloudflare Tunnel 节点；本地监听端口必须与 Tunnel route 保持一致，不能用 sb port 修改。"
+  fi
   net="$(inbound_net "$tag")"
   echo "$tag 当前端口：$old（$(net_label "$net")）"
   if [[ -z "$new" ]]; then
@@ -1642,10 +2061,16 @@ show_links() {
   shopt -s nullglob
   local files=("$DATA"/*.json)
   shopt -u nullglob
+  local filtered=()
+  for f in "${files[@]}"; do jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 && filtered+=("$f"); done
+  files=("${filtered[@]}")
   ((${#files[@]})) || { echo "尚无节点凭据文件。"; return 0; }
-  host="$(public_host)"
+  host=""
   for f in "${files[@]}"; do
-    if [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
+    if [[ "$(jq -r '.server_mode // empty' "$f")" != tunnel ]]; then host="$(public_host)"; break; fi
+  done
+  for f in "${files[@]}"; do
+    if [[ -n "$host" && "$(jq -r '.server_mode // empty' "$f")" != tunnel && "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
       jq --arg h "$host" '.server = $h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"
       rm -f "$f.tmp"
     fi
@@ -1706,6 +2131,8 @@ singbox-manager ${SCRIPT_VERSION}
   relay forward    添加端口转发（TCP/UDP → 目标地址:端口）
   relay list       查看中转/转发和分享链接
   relay del [名称] 删除中转/转发
+  tunnel [setup|status|start|stop|restart|remove|add-node] 管理 Cloudflare Tunnel
+  panel [install|status|password|restart|stop] 管理网页面板
   port [名称] [新端口]  修改节点端口（UUID、密钥、密码、指纹都不变）
   fp [名称] [指纹] 修改节点的 TLS 指纹（可多个，如 chrome,firefox 或 all），每个指纹一条分享链接
   check            校验 sing-box 配置
@@ -1741,8 +2168,9 @@ menu() {
     echo "16) 中转 / 端口转发"
     echo "17) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "18) 修改节点端口"
+    echo "19) Cloudflare Tunnel / 网页管理面板"
     echo "0) 退出"
-    read -r -p "选择 [0-18]: " choice || exit 0
+    read -r -p "选择 [0-19]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -1762,6 +2190,7 @@ menu() {
       16) relay_menu ;;
       17) cmd_fp ;;
       18) cmd_port ;;
+      19) tunnel_menu ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1809,6 +2238,36 @@ main() {
       alias_notice
       ;;
     menu) prepare_manage; menu ;;
+    tunnel)
+      prepare_manage
+      case "${2:-menu}" in
+        menu) tunnel_menu ;;
+        setup) install_cf_setup ;;
+        status|show) tunnel_status ;;
+        start|stop|restart) tunnel_service_action "${2}" ;;
+        add-node|add-ws) add_tunnel_ws ;;
+        remove|rm) remove_local_tunnel ;;
+        *) usage; exit 2 ;;
+      esac ;;
+    panel)
+      prepare_manage
+      case "${2:-install}" in
+        install|setup) install_panel ;;
+        status) panel_status ;;
+        password|reset-password) reset_panel_password ;;
+        restart|stop|start) panel_service_action "${2}" ;;
+        add-ws|add-node) add_tunnel_ws ;;
+        *) usage; exit 2 ;;
+      esac ;;
+    panel-data) need_jq; need_sb; panel_data ;;
+    panel-revoke) revoke_panel_sessions ;;
+    panel-add-ws) prepare_manage; add_tunnel_ws ;;
+    panel-delete)
+      prepare_manage
+      [[ $# -eq 2 ]] || die "用法：$(self_cmd) panel-delete 节点名称"
+      valid_tag "$2"
+      remove_by_tag "$2"
+      ;;
     relay)
       prepare_manage
       case "${2:-menu}" in

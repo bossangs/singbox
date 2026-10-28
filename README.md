@@ -1,6 +1,6 @@
 # singbox
 
-一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
+一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**，并可通过 Cloudflare Tunnel 暴露仅监听本机的网页管理面板和 VLESS WebSocket 固定域名节点。安装后输入 `sb` 就能打开管理菜单。
 
 > 下面所有代码块里的命令都可以整行复制直接运行，不需要去掉任何序号或提示符。请先切换到 root：
 
@@ -81,6 +81,7 @@ UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里�
 16) 中转 / 端口转发
 17) 修改节点 TLS 指纹（多指纹分享链接）
 18) 修改节点端口
+19) Cloudflare Tunnel / 网页管理面板
 0) 退出
 ```
 
@@ -271,6 +272,12 @@ sb relay del
 | `sb relay del 名称` | 删除中转/转发 |
 | `sb port` | 修改节点端口（按提示选择） |
 | `sb port 名称 新端口` | 直接把节点改到新端口，UUID、密钥、密码、指纹都不变 |
+| `sb tunnel setup` | 配置 Cloudflare Tunnel token、面板/节点域名并启动本机服务 |
+| `sb tunnel status` | 查看 cloudflared 状态和 Cloudflare 控制台路由映射 |
+| `sb tunnel add-node` | 添加 VLESS + WebSocket 固定域名节点 |
+| `sb panel install` | 安装或修复仅监听回环地址的网页面板 |
+| `sb panel status` | 查看面板服务和本机监听 |
+| `sb panel password` | 重置网页面板口令并撤销旧会话 |
 | `sb fp` | 查看并修改节点的 TLS 指纹 |
 | `sb fp 名称 chrome,firefox` | 把节点设为这几个指纹，每个指纹一条分享链接（`all` 表示全部可用指纹） |
 | `sb check` | 校验 sing-box 配置 |
@@ -285,6 +292,59 @@ sb relay del
 | `sb help` | 显示帮助 |
 
 如果 `/usr/local/bin/sb` 已经被别的程序占用，脚本不会覆盖它，会提示你改用 `./singbox-manager.sh` 加上面的命令，例如 `./singbox-manager.sh links`。
+
+## Cloudflare Tunnel 与网页管理面板
+
+本脚本可用一个远程管理的 Cloudflare Tunnel 同时转发两个独立 hostname：一个用于访问管理网页，另一个用于 VLESS WebSocket 节点。它不自动创建 Cloudflare 账户、Tunnel、DNS 或 Access 策略；这些项目需先在 Cloudflare Zero Trust 控制台创建。官方步骤见 [创建远程管理 Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) 和 [Tunnel 支持的应用协议](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/protocols/)。
+
+### 设置步骤
+
+1. 在 Cloudflare Zero Trust → **Networks → Tunnels** 创建一个远程管理 Tunnel，并复制它的运行 token。Cloudflare 明确说明，拿到 token 的人可以运行该 Tunnel，因此不要把 token 发给他人。
+2. 在 VPS 上更新到本仓库最新版，然后运行：
+
+   ```bash
+   sb tunnel setup
+   ```
+
+   按提示输入面板域名、节点域名和 Tunnel token。token 输入时不回显，并以 root-only 文件保存；脚本安装 `cloudflared`，建立独立的 systemd 或 OpenRC 服务，再启动网页面板。
+3. 按脚本输出，在 Cloudflare Tunnel 的 **Routes → Add route → Published application** 中配置两条服务：
+   - `panel.example.com` → `http://127.0.0.1:8765`
+   - `node.example.com` → `http://127.0.0.1:<脚本显示的节点端口>`
+
+   请换成自己的两个域名和脚本显示的端口。面板与节点建议使用不同 hostname。远程管理 Tunnel 的 Published application routes 和 DNS 记录需在 Cloudflare 控制台配置。
+4. 为**面板 hostname**创建 Cloudflare Access 应用和允许访问的身份策略（建议使用 MFA）；这与面板自身口令是两道不同的保护。节点 hostname 不要套用会返回浏览器登录页的 Access 策略，因为代理客户端无法完成网页登录。
+5. 打开 `https://panel.example.com`，输入脚本首次安装时只显示一次的随机面板口令。面板提供服务状态、现有节点分享链接、删除节点、重启 sing-box，以及创建固定域名 Tunnel 节点的操作。
+
+### 创建固定域名节点
+
+可在网页面板点“创建 Tunnel 节点”，或通过 SSH 执行：
+
+```bash
+sb tunnel add-node
+```
+
+它会新增一个独立的 **VLESS + WebSocket** 入站，仅监听 `127.0.0.1`，使用随机 UUID 与随机 WS path。脚本先备份配置，再执行 `sing-box check`、重启并确认监听；失败会恢复原配置。节点链接使用固定的 Tunnel hostname，不会被 `sb host` 改成 VPS 公网 IP。删除或重新创建 Tunnel 节点时，要确保 Cloudflare route 仍指向脚本输出的本机端口。
+
+状态与管理命令：
+
+```bash
+sb tunnel status       # Tunnel 服务、路由映射和最近日志
+sb tunnel restart      # 重启 cloudflared
+sb panel status        # 面板服务与本机监听
+sb panel password      # 重置面板口令并撤销旧会话
+```
+
+Tunnel 与面板服务彼此独立。移除本机 Tunnel：`sb tunnel remove`；这只移除 VPS 上的 connector/token，不会删除 Cloudflare 控制台资源，也不会删除 sing-box 节点或面板。
+
+### 兼容性和安全边界
+
+- 本方案的固定域名链接是 **VLESS + WebSocket + TLS**：客户端 TLS 在 Cloudflare 边缘结束，再由 WebSocket 经 Tunnel 转到本机。Cloudflare 支持代理 WebSocket；本机的 VLESS 入站不直接监听公网。
+- 这不是通用 TCP/UDP 隧道。Cloudflare 文档说明，发布为 TCP 的非 HTTP 服务通常要求客户端另装 `cloudflared`；因此本项目不把普通 VLESS TCP/Reality、Hysteria2、TUIC、AnyTLS 或 UDP 转发伪装成可直接使用的 Tunnel 节点。现有普通节点不受影响。
+- 网页面板只绑定 `127.0.0.1:8765`，Tunnel 节点只绑定 `127.0.0.1` 的本机 WS 端口；不需要为它们新增 VPS 入站防火墙规则。connector 通过出站连接接入 Cloudflare，网络需允许访问 Cloudflare Tunnel 服务。
+- 面板使用独立低权限 Linux 用户，管理动作通过窄范围 sudo helper 进行；口令以哈希保存，服务端有登录失败限速、签名会话和 CSRF 校验。仍建议同时启用 Cloudflare Access、使用强口令并及时更新脚本。
+- TLS 是客户端到 Cloudflare 边缘的 HTTPS/TLS；Cloudflare 到本机服务这一段经加密 Tunnel 传输，`cloudflared` 到本机源站为 loopback HTTP。Cloudflare 服务可用性、网络策略和条款会影响连接，脚本不承诺特定速度、稳定性或无限流量。
+
+相关官方说明：[Cloudflare WebSocket 支持](https://developers.cloudflare.com/network/websockets/)、[Cloudflare Tunnel 的 TCP 客户端要求](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/protocols/)、[Tunnel token 安全说明](https://developers.cloudflare.com/tunnel/reference/tunnel-tokens/)、[sing-box VLESS 入站](https://sing-box.sagernet.org/configuration/inbound/vless/) 与 [WebSocket transport](https://sing-box.sagernet.org/configuration/shared/v2ray-transport/)。
 
 ## 更新脚本
 
