@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.28.3"
+SCRIPT_VERSION="2026.10.28.4"
 MARK="# @bossangs-singbox-manager"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
@@ -1808,6 +1808,7 @@ menu() {
   while true; do
     echo
     echo "========== sing-box 多协议管理 ${SCRIPT_VERSION} =========="
+    echo "Telegram: https://t.me/o2oyww"
     echo "1) 添加 VLESS + Reality"
     echo "2) 添加 Hysteria2"
     echo "3) 添加 TUIC"

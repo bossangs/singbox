@@ -65,6 +65,7 @@ Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提
 
 ```
 ========== sing-box 多协议管理 ==========
+Telegram: https://t.me/o2oyww
 1) 添加 VLESS + Reality
 2) 添加 Hysteria2
 3) 添加 TUIC
