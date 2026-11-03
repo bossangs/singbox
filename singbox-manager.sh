@@ -2,15 +2,29 @@
 # @bossangs-singbox-manager
 # singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu (systemd) and Alpine (OpenRC)
 # https://github.com/bossangs/singbox
-# Supports VLESS + Reality, Hysteria2, TUIC, AnyTLS, Shadowsocks, Telegram SOCKS5, relays and port forwarding.
+# Supports sing-box protocols plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
 # If another sing-box one-click script is detected, nothing is changed; cleanup steps are printed instead.
 
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.10.28.4"
+SCRIPT_VERSION="2026.11.03.2"
 MARK="# @bossangs-singbox-manager"
+XRAY_MARK="# @bossangs-singbox-xray"
+XRAY_USER="singbox-xray"
+XRAY_BIN="/usr/local/bin/singbox-xray"
+XRAY_DIR="/etc/singbox-xray"
+XRAY_DIR_MARKER="$XRAY_DIR/.managed-by-singbox-manager"
+XRAY_CONF="$XRAY_DIR/config.json"
+XRAY_DATA="$XRAY_DIR/manager"
+XRAY_CERT_DIR="$XRAY_DIR/certs"
+XRAY_BACKUP_DIR="/var/backups/singbox-xray"
+XRAY_BACKUP_MARKER="$XRAY_BACKUP_DIR/.managed-by-singbox-manager"
+XRAY_SERVICE="singbox-xray"
+XRAY_UNIT="/etc/systemd/system/singbox-xray.service"
+XRAY_INIT="/etc/init.d/singbox-xray"
+XRAY_LOG="/var/log/singbox-xray.log"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
 CONF_DIR="/etc/sing-box"
@@ -148,11 +162,19 @@ install_shortcut() {
   fi
 }
 cmd_update() {
-  local tmp new_ver
+  local tmp new_ver oldest
   shortcut_is_foreign && die "$SHORTCUT 已被其他程序占用，未更新。"
   tmp="$(mktemp)"
   fetch_latest "$tmp"
   new_ver="$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' "$tmp" | head -n1)"
+  if [[ -z "$new_ver" ]]; then rm -f "$tmp"; die "远端脚本版本号缺失，未更新。"; fi
+  oldest="$(printf '%s\n%s\n' "$new_ver" "$SCRIPT_VERSION" | sort -V | head -n1)"
+  if [[ "$oldest" == "$new_ver" && "$new_ver" != "$SCRIPT_VERSION" ]]; then
+    rm -f "$tmp"
+    echo "未更新：本地构建 $SCRIPT_VERSION 比远端 $new_ver 新，包含尚未发布的 Xray 功能；为避免回退，未覆盖 sb。"
+    echo "要保留此功能，请从本地安装包更新；后续发布版本后再使用 sb update。"
+    return 0
+  fi
   install -m 755 "$tmp" "$SHORTCUT"
   rm -f "$tmp"
   echo "已更新 sb：${SCRIPT_VERSION} -> ${new_ver:-未知}。运行 sb 打开管理菜单。"
@@ -556,12 +578,12 @@ install_deps() {
   if have apk && ! have apt-get; then
     apk update
     # Alpine 默认只有 BusyBox，补齐脚本用到的 GNU 工具和 ss
-    apk add bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc
+    apk add bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc unzip
     return
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates curl jq openssl iproute2
+  apt-get install -y ca-certificates curl jq openssl iproute2 unzip
 }
 latest_sb_version() {
   # 通过 releases/latest 的跳转读取版本号，不占用 GitHub API 次数
@@ -884,8 +906,405 @@ ask_tls_host() {
     chmod 644 "$CERT_DIR/server.crt"
   fi
 }
+xray_arch() {
+  # Xray 官方发行包的架构名称。
+  case "$(uname -m)" in
+    x86_64|amd64) echo 64 ;;
+    i386|i486|i586|i686|x86) echo 32 ;;
+    armv5*) echo arm32-v5 ;;
+    armv6*) echo arm32-v6 ;;
+    armv7*|armhf) if grep -qw vfp /proc/cpuinfo 2>/dev/null; then echo arm32-v7a; else echo arm32-v5; fi ;;
+    aarch64|arm64) echo arm64-v8a ;;
+    loongarch64|loong64) echo loong64 ;;
+    mips) echo mips32 ;;
+    mipsel) echo mips32le ;;
+    mips64) if have lscpu && lscpu 2>/dev/null | grep -q 'Little Endian'; then echo mips64le; else echo mips64; fi ;;
+    mips64el) echo mips64le ;;
+    ppc64) echo ppc64 ;;
+    ppc64le) echo ppc64le ;;
+    riscv64) echo riscv64 ;;
+    s390x) echo s390x ;;
+    *) return 1 ;;
+  esac
+}
+xray_install_core() {
+  local latest version arch base tmp expected actual candidate
+  if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
+    "$XRAY_BIN" version >/dev/null 2>&1 || die "$XRAY_BIN 已存在但不是可运行的 Xray 内核；未覆盖任何文件"
+    echo "已检测到本脚本使用的 Xray 内核：$XRAY_BIN"
+    return 0
+  fi
+  arch="$(xray_arch)" || die "Xray 官方发行包暂不支持此 CPU 架构：$(uname -m)"
+  echo "正在从 Xray 官方 GitHub Releases 安装 Xray 内核（架构：$arch）……"
+  latest="$(curl -fsSLI --max-time 30 -o /dev/null -w '%{url_effective}' https://github.com/XTLS/Xray-core/releases/latest)" || die "读取 Xray 官方最新版本失败"
+  version="${latest##*/}"
+  [[ "$version" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] || die "无法识别 Xray 官方版本号：$version"
+  base="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${arch}.zip"
+  tmp="$(mktemp -d)"
+  if ! curl -fL --retry 2 --connect-timeout 15 --max-time 300 "$base" -o "$tmp/xray.zip"; then
+    rm -rf "$tmp"; die "下载 Xray 官方发行包失败：$base"
+  fi
+  if ! curl -fL --retry 2 --connect-timeout 15 --max-time 60 "${base}.dgst" -o "$tmp/xray.zip.dgst"; then
+    rm -rf "$tmp"; die "下载 Xray 官方校验文件失败，拒绝安装未校验的内核"
+  fi
+  expected="$(awk -F '=' '/^[[:space:]]*SHA(2-)?256[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print tolower($2); exit}' "$tmp/xray.zip.dgst")"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { rm -rf "$tmp"; die "Xray 官方 SHA-256 校验文件格式无效"; }
+  actual="$(sha256sum "$tmp/xray.zip" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || { rm -rf "$tmp"; die "Xray 官方发行包 SHA-256 校验失败，未安装"; }
+  if ! unzip -q "$tmp/xray.zip" -d "$tmp/unpack" || [[ ! -x "$tmp/unpack/xray" ]] || ! "$tmp/unpack/xray" version >/dev/null 2>&1; then
+    rm -rf "$tmp"; die "Xray 官方压缩包无法解压或内核不能在本机运行"
+  fi
+  install -m 755 "$tmp/unpack/xray" "$XRAY_BIN"
+  rm -rf "$tmp"
+  echo "已安装并通过 SHA-256 校验：$XRAY_BIN（$version）"
+}
+xray_prepare_user() {
+  if ! id -u "$XRAY_USER" >/dev/null 2>&1; then
+    if have apk && ! have apt-get; then
+      addgroup -S "$XRAY_USER" 2>/dev/null || true
+      adduser -S -D -H -h /var/empty -s /sbin/nologin -G "$XRAY_USER" "$XRAY_USER"
+    else
+      useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --user-group "$XRAY_USER"
+    fi
+  fi
+  [[ "$(id -u "$XRAY_USER")" != 0 ]] || die "专用 Xray 服务账号不能是 root"
+}
+xray_write_service() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    if [[ -e "$XRAY_UNIT" || -L "$XRAY_UNIT" ]] && ! grep -qxF "$XRAY_MARK" "$XRAY_UNIT" 2>/dev/null; then
+      die "$XRAY_UNIT 已存在且不属于本脚本；为保护现有服务，未覆盖"
+    fi
+    cat >"$XRAY_UNIT" <<UNIT
+[Unit]
+Description=sing-box manager Xray sidecar
+Documentation=https://xtls.github.io/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${XRAY_USER}
+Group=${XRAY_USER}
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=${XRAY_DIR}
+ExecStart=${XRAY_BIN} run -config ${XRAY_CONF}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+${XRAY_MARK}
+UNIT
+    chmod 644 "$XRAY_UNIT"
+    systemctl daemon-reload
+  elif is_openrc; then
+    if [[ -e "$XRAY_INIT" || -L "$XRAY_INIT" ]] && ! grep -qxF "$XRAY_MARK" "$XRAY_INIT" 2>/dev/null; then
+      die "$XRAY_INIT 已存在且不属于本脚本；为保护现有服务，未覆盖"
+    fi
+    cat >"$XRAY_INIT" <<RC
+#!/sbin/openrc-run
+${XRAY_MARK}
+name="singbox-xray"
+description="Xray sidecar for sing-box manager"
+supervisor="supervise-daemon"
+command="${XRAY_BIN}"
+command_args="run -config ${XRAY_CONF}"
+command_user="${XRAY_USER}:${XRAY_USER}"
+output_log="${XRAY_LOG}"
+error_log="${XRAY_LOG}"
+respawn_delay=3
+respawn_max=0
+
+start_pre() {
+  "${XRAY_BIN}" run -test -config "${XRAY_CONF}"
+}
+RC
+    chmod 755 "$XRAY_INIT"
+    touch "$XRAY_LOG"
+    chown "$XRAY_USER:$XRAY_USER" "$XRAY_LOG"
+    chmod 640 "$XRAY_LOG"
+  else
+    die "没有找到 systemd 或 OpenRC，无法管理 Xray sidecar"
+  fi
+}
+xray_enable_service() {
+  if is_openrc; then rc-update add "$XRAY_SERVICE" default >/dev/null 2>&1 || true
+  else systemctl enable "$XRAY_SERVICE" >/dev/null 2>&1 || true; fi
+}
+xray_trim_log() {
+  [[ -f "$XRAY_LOG" ]] || return 0
+  local bytes tmp
+  bytes="$(wc -c <"$XRAY_LOG")"
+  if ((bytes > 20 * 1024 * 1024)); then
+    tmp="${XRAY_LOG}.tmp"
+    tail -n 5000 "$XRAY_LOG" >"$tmp"
+    cat "$tmp" >"$XRAY_LOG"
+    rm -f "$tmp"
+    chown "$XRAY_USER:$XRAY_USER" "$XRAY_LOG"
+    chmod 640 "$XRAY_LOG"
+  fi
+}
+xray_restart_service() {
+  if is_openrc; then
+    rc-service "$XRAY_SERVICE" stop >/dev/null 2>&1 || true
+    xray_trim_log
+    rc-service "$XRAY_SERVICE" start
+  else systemctl reset-failed "$XRAY_SERVICE" >/dev/null 2>&1 || true; systemctl restart "$XRAY_SERVICE"; fi
+}
+xray_service_active() {
+  if is_openrc; then rc-service "$XRAY_SERVICE" status >/dev/null 2>&1
+  else [[ "$(systemctl is-active "$XRAY_SERVICE" 2>/dev/null)" == active ]]; fi
+}
+xray_check_config() {
+  "$XRAY_BIN" run -test -config "$XRAY_CONF"
+}
+xray_service_healthy() {
+  local port="${1:-}" i
+  for ((i = 0; i < 20; i++)); do
+    if xray_service_active; then
+      if [[ -z "$port" ]] || ss -H -lnt "( sport = :$port )" 2>/dev/null | grep -q .; then return 0; fi
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+xray_prepare() {
+  local d
+  [[ ! -L "$XRAY_DIR" ]] || die "$XRAY_DIR 是符号链接，为保护现有文件未继续操作"
+  if [[ -e "$XRAY_DIR" && ! -f "$XRAY_DIR_MARKER" ]]; then
+    die "$XRAY_DIR 已存在且没有本脚本所有权标记；为保护现有配置/数据，未修改该目录"
+  fi
+  if [[ -e "$XRAY_BACKUP_DIR" && ! -f "$XRAY_BACKUP_MARKER" ]]; then
+    die "$XRAY_BACKUP_DIR 已存在且没有本脚本所有权标记；为保护现有数据，未修改该目录"
+  fi
+  [[ ! -L "$XRAY_BACKUP_DIR" ]] || die "$XRAY_BACKUP_DIR 是符号链接，为保护现有文件未继续操作"
+  [[ ! -L "$XRAY_CONF" ]] || die "$XRAY_CONF 是符号链接，为保护现有文件未继续操作"
+  if [[ "$INIT_SYS" == systemd && ( -e "$XRAY_UNIT" || -L "$XRAY_UNIT" ) ]] && ! grep -qxF "$XRAY_MARK" "$XRAY_UNIT" 2>/dev/null; then
+    die "$XRAY_UNIT 已存在且不属于本脚本；为保护现有服务，未安装或修改 Xray 文件"
+  fi
+  if is_openrc && [[ -e "$XRAY_INIT" || -L "$XRAY_INIT" ]] && ! grep -qxF "$XRAY_MARK" "$XRAY_INIT" 2>/dev/null; then
+    die "$XRAY_INIT 已存在且不属于本脚本；为保护现有服务，未安装或修改 Xray 文件"
+  fi
+  xray_prepare_user
+  xray_install_core
+  mkdir -p "$XRAY_DIR" "$XRAY_DATA" "$XRAY_CERT_DIR" "$XRAY_BACKUP_DIR"
+  for d in "$XRAY_DATA" "$XRAY_CERT_DIR" "$XRAY_BACKUP_DIR"; do
+    [[ ! -L "$d" ]] || die "$d 是符号链接，为保护现有文件未继续操作"
+  done
+  if [[ ! -f "$XRAY_DIR_MARKER" ]]; then
+    printf '%s\n' "$XRAY_MARK" >"$XRAY_DIR_MARKER"
+    chmod 600 "$XRAY_DIR_MARKER"
+  fi
+  if [[ ! -f "$XRAY_BACKUP_MARKER" ]]; then
+    printf '%s\n' "$XRAY_MARK" >"$XRAY_BACKUP_MARKER"
+    chmod 600 "$XRAY_BACKUP_MARKER"
+  fi
+  chown root:"$XRAY_USER" "$XRAY_DIR" "$XRAY_CERT_DIR"
+  chmod 750 "$XRAY_DIR" "$XRAY_CERT_DIR"
+  chown root:root "$XRAY_DATA" "$XRAY_BACKUP_DIR"
+  chmod 700 "$XRAY_DATA" "$XRAY_BACKUP_DIR"
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    cat >"$XRAY_CONF" <<'JSON'
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [],
+  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
+JSON
+  fi
+  chown root:"$XRAY_USER" "$XRAY_CONF"
+  chmod 640 "$XRAY_CONF"
+  xray_write_service
+  xray_check_config || die "Xray 当前配置校验失败，未继续修改；查看配置：$XRAY_CONF"
+}
+xray_backup_config() {
+  local b="$XRAY_BACKUP_DIR/config-$(date +%Y%m%d-%H%M%S-%N).json"
+  cp -a "$XRAY_CONF" "$b"
+  chmod 600 "$b"
+  printf '%s' "$b"
+}
+xray_commit_jq() {
+  # 第一参数是期望监听端口（空表示只检查服务状态），其余参数原样传给 jq。
+  local expected_port="$1" backup tmp
+  shift
+  tmp="${XRAY_CONF}.tmp"
+  backup="$(xray_backup_config)"
+  if ! jq "$@" "$XRAY_CONF" >"$tmp"; then rm -f "$tmp"; die "生成 Xray 新配置失败，未做任何改动"; fi
+  install -o root -g "$XRAY_USER" -m 640 "$tmp" "$XRAY_CONF"
+  rm -f "$tmp"
+  if ! xray_check_config; then
+    cp -a "$backup" "$XRAY_CONF"; chown root:"$XRAY_USER" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
+    die "Xray 配置校验失败，已恢复修改前配置（没有任何改动）"
+  fi
+  xray_enable_service
+  if ! xray_restart_service || ! xray_service_healthy "$expected_port"; then
+    cp -a "$backup" "$XRAY_CONF"; chown root:"$XRAY_USER" "$XRAY_CONF"; chmod 640 "$XRAY_CONF"
+    xray_restart_service >/dev/null 2>&1 || true
+    die "Xray 未能按新配置启动或监听端口；已恢复旧配置。查看服务日志：$(xray_log_hint)"
+  fi
+}
+xray_log_hint() { if is_openrc; then echo "tail -n 100 $XRAY_LOG"; else echo "journalctl -u $XRAY_SERVICE -n 100 --no-pager"; fi; }
+xray_port_in_config() { jq -e --argjson p "$1" '[.inbounds[]? | select(.port == $p)] | length > 0' "$XRAY_CONF" >/dev/null 2>&1; }
+xray_valid_path() { [[ "$1" == /* && ! "$1" =~ [[:space:]] ]]; }
+xray_free_port() {
+  local p="$1" i
+  for ((i = 0; i < 500; i++, p++)); do
+    (( p <= 65535 )) || p=20000
+    port_in_config "$p" && continue
+    xray_port_in_config "$p" && continue
+    port_free "$p" tcp || continue
+    printf '%s' "$p"; return 0
+  done
+  printf '%s' "$1"
+}
+xray_make_cert() {
+  local tag="$1" host="$2" san cert key fingerprint
+  cert="$XRAY_CERT_DIR/$tag.crt"; key="$XRAY_CERT_DIR/$tag.key"
+  [[ ! -e "$cert" && ! -e "$key" ]] || die "Xray 节点证书文件已存在：$tag（未覆盖）"
+  if valid_ipv4 "$host" || valid_ipv6 "$host"; then san="IP:$host"; else san="DNS:$host"; fi
+  openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 825 \
+    -keyout "$key" -out "$cert" -subj "/CN=${host}" -addext "subjectAltName=${san}" >/dev/null 2>&1 || die "生成 Xray 自签证书失败"
+  chown root:"$XRAY_USER" "$cert" "$key"
+  chmod 640 "$cert" "$key"
+  fingerprint="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | sed 's/.*=//' | tr -d ':' | tr 'A-F' 'a-f')"
+  [[ "$fingerprint" =~ ^[0-9a-f]{64}$ ]] || die "计算自签证书 SHA-256 指纹失败"
+  printf '%s\n%s\n%s' "$cert" "$key" "$fingerprint"
+}
+xray_add_node() {
+  local tag host port choice network uri_type cert_result cert key fingerprint uuid path vhost service_name transport obj meta
+  xray_prepare
+  ask_tag tag xray-tls
+  prompt port "Xray TCP 端口" "$(xray_free_port 8443)"
+  valid_port "$port" || die "端口必须是 1-65535 的数字"
+  port="$((10#$port))"
+  if is_openrc && ((port < 1024)); then die "Alpine/OpenRC 下 Xray 以专用非 root 用户运行，请选择 1024 以上的端口"; fi
+  port_in_config "$port" && die "端口 $port 已被 sing-box 节点占用"
+  xray_port_in_config "$port" && die "端口 $port 已被其他 Xray 节点占用"
+  port_free "$port" tcp || die "端口 $port/tcp 已被其他程序占用"
+  host="$(public_host)"
+  prompt TLS_HOST "证书域名或 IP（自签证书会按此生成）" "$host"
+  valid_host "$TLS_HOST" || die "证书域名/IP 格式无效"
+  echo "Xray + TLS 传输方式（默认优选 XHTTP auto）："
+  echo "1) XHTTP / auto（推荐）"
+  echo "2) RAW/TCP"
+  echo "3) WebSocket（上游已标记弃用）"
+  echo "4) gRPC（上游已标记弃用）"
+  echo "5) HTTPUpgrade（上游已标记弃用）"
+  read -r -p "选择 [1-5，默认 1]: " choice || choice=1
+  case "${choice:-1}" in
+    1)
+      network=xhttp; uri_type=xhttp
+      path="/xhttp-$(random_hex 4)"
+      prompt path "XHTTP path" "$path"
+      xray_valid_path "$path" || die "XHTTP path 必须以 / 开头且不能包含空白字符"
+      prompt vhost "XHTTP Host（默认使用证书域名/IP）" "$TLS_HOST"
+      valid_host "$vhost" || die "XHTTP Host 必须是有效域名或 IP"
+      transport="$(jq -n --arg host "$vhost" --arg path "$path" '{xhttpSettings:{host:$host,path:$path,mode:"auto"}}')"
+      ;;
+    2) network=raw; uri_type=tcp; transport='{}' ;;
+    3)
+      network=ws; uri_type=ws
+      path="/ws-$(random_hex 4)"
+      prompt path "WebSocket path" "$path"
+      xray_valid_path "$path" || die "WebSocket path 必须以 / 开头且不能包含空白字符"
+      prompt vhost "WebSocket Host" "$TLS_HOST"
+      valid_host "$vhost" || die "WebSocket Host 必须是有效域名或 IP"
+      transport="$(jq -n --arg host "$vhost" --arg path "$path" '{wsSettings:{host:$host,path:$path}}')"
+      ;;
+    4)
+      network=grpc; uri_type=grpc
+      service_name="grpc-$(clean_tag_fragment "$tag")"
+      prompt service_name "gRPC serviceName" "$service_name"
+      [[ -n "$service_name" && ! "$service_name" =~ [[:space:]] ]] || die "gRPC serviceName 不能为空且不能包含空白字符"
+      transport="$(jq -n --arg name "$service_name" '{grpcSettings:{serviceName:$name}}')"
+      ;;
+    5)
+      network=httpupgrade; uri_type=httpupgrade
+      path="/upgrade-$(random_hex 4)"
+      prompt path "HTTPUpgrade path" "$path"
+      xray_valid_path "$path" || die "HTTPUpgrade path 必须以 / 开头且不能包含空白字符"
+      prompt vhost "HTTPUpgrade Host" "$TLS_HOST"
+      valid_host "$vhost" || die "HTTPUpgrade Host 必须是有效域名或 IP"
+      transport="$(jq -n --arg host "$vhost" --arg path "$path" '{httpupgradeSettings:{host:$host,path:$path}}')"
+      ;;
+    *) die "无效传输方式" ;;
+  esac
+  uuid="$("$XRAY_BIN" uuid)" || die "生成 VLESS UUID 失败"
+  cert_result="$(xray_make_cert "$tag" "$TLS_HOST")"
+  cert="$(sed -n '1p' <<<"$cert_result")"
+  key="$(sed -n '2p' <<<"$cert_result")"
+  fingerprint="$(sed -n '3p' <<<"$cert_result")"
+  # Xray 当前仍兼容 network；method 优先级更高，因此只写 network，避免产生字段覆盖歧义。
+  obj="$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg cert "$cert" --arg key "$key" \
+    --arg network "$network" --argjson port "$port" --argjson transport "$transport" \
+    '{tag:$tag,listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,email:$tag}],decryption:"none"},streamSettings:({network:$network,security:"tls",tlsSettings:{alpn:["h2","http/1.1"],certificates:[{certificateFile:$cert,keyFile:$key}]}} + $transport)}')"
+  meta="$(jq -n --arg tag "$tag" --arg host "$host" --arg uuid "$uuid" --arg sni "$TLS_HOST" \
+    --arg cert "$cert" --arg key "$key" --arg fp "$fingerprint" --arg network "$network" --arg type "$uri_type" \
+    --arg path "${path:-}" --arg xhost "${vhost:-}" --arg service "${service_name:-}" --argjson port "$port" \
+    '{protocol:"VLESS + TLS (Xray)",tag:$tag,server:$host,port:$port,uuid:$uuid,sni:$sni,transport:$type,xray_network:$network,certificate:$cert,key:$key,certificate_sha256:$fp} + (if $path != "" then {path:$path} else {} end) + (if $xhost != "" then {host:$xhost} else {} end) + (if $service != "" then {service_name:$service} else {} end)')"
+  install -m 600 /dev/null "$XRAY_DATA/$tag.json"
+  printf '%s\n' "$meta" >"$XRAY_DATA/$tag.json"
+  if ! xray_commit_jq "$port" --argjson obj "$obj" '.inbounds += [$obj]'; then
+    rm -f "$XRAY_DATA/$tag.json" "$cert" "$key"; return 1
+  fi
+  echo "Xray VLESS + TLS 节点已添加：$tag（$uri_type；Xray $("$XRAY_BIN" version | awk 'NR==1{print $2}')）"
+  echo "证书采用自签 + SHA-256 pin；客户端需支持分享链接参数 pcs，不能支持时请使用受信任证书或客户端的证书指纹设置。"
+  print_link "$XRAY_DATA/$tag.json"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
+}
+xray_remove_node() {
+  local tag="$1" cert key
+  [[ -f "$XRAY_DATA/$tag.json" ]] || die "没有名为 $tag 的 Xray 节点"
+  cert="$(jq -r '.certificate // empty' "$XRAY_DATA/$tag.json")"
+  key="$(jq -r '.key // empty' "$XRAY_DATA/$tag.json")"
+  xray_commit_jq "" --arg t "$tag" '.inbounds |= map(select(.tag != $t))'
+  rm -f "$XRAY_DATA/$tag.json" "$cert" "$key"
+  echo "已删除 Xray 节点：$tag（其他 sing-box 节点不受影响）"
+}
+xray_change_port() {
+  local tag="$1" new="$2" meta old tmp
+  meta="$XRAY_DATA/$tag.json"
+  [[ -f "$meta" ]] || die "没有名为 $tag 的 Xray 节点"
+  old="$(jq -r .port "$meta")"
+  if [[ -z "$new" ]]; then new="$(xray_free_port "$((old + 1))")"; prompt new "新 Xray TCP 端口" "$new"; fi
+  valid_port "$new" || die "端口必须是 1-65535 的数字"
+  new="$((10#$new))"
+  if is_openrc && ((new < 1024)); then die "Alpine/OpenRC 下 Xray 以专用非 root 用户运行，请选择 1024 以上的端口"; fi
+  [[ "$new" != "$old" ]] || { echo "新端口和当前端口相同（$old），没有改动。"; return 0; }
+  port_in_config "$new" && die "端口 $new 已被 sing-box 节点占用"
+  xray_port_in_config "$new" && die "端口 $new 已被其他 Xray 节点占用"
+  port_free "$new" tcp || die "端口 $new/tcp 已被其他程序占用"
+  xray_commit_jq "$new" --arg t "$tag" --argjson p "$new" '.inbounds |= map(if .tag == $t then .port = $p else . end)'
+  tmp="$meta.tmp"
+  jq --argjson p "$new" --arg h "$(public_host)" '.port=$p | .server=$h' "$meta" >"$tmp"
+  install -m 600 "$tmp" "$meta"; rm -f "$tmp"
+  echo "已把 Xray 节点 $tag 的端口从 $old 改为 $new。"
+  print_link "$meta"
+  echo "请放行 TCP $new，并关闭不再使用的 TCP $old。"
+}
+xray_status() {
+  if [[ ! -x "$XRAY_BIN" ]]; then echo "Xray sidecar 尚未安装。添加 VLESS + TLS 节点时会从官方发行包安装。"; return 0; fi
+  echo "=== Xray 版本 ==="; "$XRAY_BIN" version | head -n2 || true
+  echo "=== Xray sidecar 服务 ==="
+  if is_openrc; then rc-service "$XRAY_SERVICE" status || true
+  else systemctl --no-pager --full status "$XRAY_SERVICE" || true; fi
+  echo "=== Xray TCP 监听 ==="; ss -lntp | grep -E 'singbox-xray|xray' || true
+}
+xray_logs() {
+  local n="${1:-100}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=100
+  if is_openrc; then [[ -s "$XRAY_LOG" ]] && tail -n "$n" "$XRAY_LOG" || echo "暂无 Xray 日志（$XRAY_LOG）"
+  else journalctl -u "$XRAY_SERVICE" -n "$n" --no-pager; fi
+}
+
 tag_exists() {
-  jq -e --arg t "$1" '[.inbounds[]?, .outbounds[]? | select(.tag == $t)] | length > 0' "$CONF" >/dev/null 2>&1 || [[ -e "$DATA/$1.json" ]]
+  jq -e --arg t "$1" '[.inbounds[]?, .outbounds[]? | select(.tag == $t)] | length > 0' "$CONF" >/dev/null 2>&1 || [[ -e "$DATA/$1.json" || -e "$XRAY_DATA/$1.json" ]]
 }
 next_tag() {
   local base="$1" n=1
@@ -956,6 +1375,27 @@ print_link() {
       fi
       jq -r --arg h "$h" '(.fps // [.fp // "chrome"]) as $fps | $fps[] as $fp
         | "vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=\($fp)&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
+    "VLESS + TLS (Xray)")
+      local uuid qname qhost qpath qservice qfp typ
+      uuid="$(urlencode "$(jq -r '.uuid' "$f")")"
+      qname="$(urlencode "$(jq -r '.tag' "$f")")"
+      qfp="$(urlencode "$(jq -r '.certificate_sha256' "$f")")"
+      typ="$(jq -r '.transport' "$f")"
+      printf '分享链接（Xray VLESS + TLS；自签证书 SHA-256 pin）：\n'
+      printf 'vless://%s@%s:%s?encryption=none&security=tls&type=%s&sni=%s&fp=chrome&pcs=%s' \
+        "$uuid" "$h" "$(jq -r '.port' "$f")" "$typ" "$(urlencode "$(jq -r '.sni' "$f")")" "$qfp"
+      case "$typ" in
+        xhttp)
+          qhost="$(urlencode "$(jq -r '.host // empty' "$f")")"; qpath="$(urlencode "$(jq -r '.path' "$f")")"
+          printf '&host=%s&path=%s&mode=auto' "$qhost" "$qpath" ;;
+        ws|httpupgrade)
+          qhost="$(urlencode "$(jq -r '.host // empty' "$f")")"; qpath="$(urlencode "$(jq -r '.path' "$f")")"
+          printf '&host=%s&path=%s' "$qhost" "$qpath" ;;
+        grpc) qservice="$(urlencode "$(jq -r '.service_name' "$f")")"; printf '&serviceName=%s' "$qservice" ;;
+      esac
+      printf '#%s\n' "$qname"
+      echo "提示：pcs 是证书 SHA-256 pin（不是跳过验证）；客户端需支持 Xray 分享链接提案中的 pcs 参数。"
+      ;;
     Hysteria2)
       echo "分享链接（自签证书，客户端需允许不安全证书）："
       jq -r --arg h "$h" '"hysteria2://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
@@ -1457,6 +1897,7 @@ relay_list() {
 remove_by_tag() {
   # 删除入站，以及它对应的落地出站、路由规则、凭据和中转记录
   local tag="$1" out=""
+  [[ -f "$XRAY_DATA/$tag.json" ]] && { xray_remove_node "$tag"; return 0; }
   jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONF" >/dev/null || die "未找到节点 $tag"
   [[ -f "$RELAY_DIR/$tag.json" ]] && out="$(jq -r '.outbound // empty' "$RELAY_DIR/$tag.json")"
   commit_jq --arg tag "$tag" --arg out "$out" '
@@ -1612,6 +2053,7 @@ cmd_port() {
   fi
   [[ -n "$tag" ]] || die "名称不能为空"
   valid_tag "$tag"
+  if [[ -f "$XRAY_DATA/$tag.json" ]]; then xray_change_port "$tag" "$new"; return 0; fi
   old="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .listen_port' "$CONF")"
   [[ -n "$old" && "$old" != null ]] || die "配置里没有名为 $tag 的节点"
   meta="$RELAY_DIR/$tag.json"
@@ -1708,6 +2150,12 @@ list_nodes() {
   echo "已配置的入站节点："
   jq -r '.inbounds[]? | [(.tag // "-"), .type, (.listen_port|tostring), (.listen // "0.0.0.0")] | @tsv' "$CONF" |
     awk 'BEGIN{printf "%-24s %-16s %-8s %s\n","TAG","协议","端口","监听地址"} {printf "%-24s %-16s %-8s %s\n",$1,$2,$3,$4}'
+  if compgen -G "$XRAY_DATA/*.json" >/dev/null; then
+    echo "Xray sidecar 节点："
+    for f in "$XRAY_DATA"/*.json; do
+      printf '%-24s %-16s %-8s %s\n' "$(jq -r .tag "$f")" "VLESS/TLS $(jq -r .transport "$f")" "$(jq -r .port "$f")" "::"
+    done
+  fi
   echo
   echo "凭据文件（含敏感信息，权限仅 root 可读）：$DATA/*.json"
 }
@@ -1725,7 +2173,10 @@ show_links() {
   shopt -s nullglob
   local files=("$DATA"/*.json)
   shopt -u nullglob
-  ((${#files[@]})) || { echo "尚无节点凭据文件。"; return 0; }
+  if ((${#files[@]} == 0)) && ! compgen -G "$XRAY_DATA/*.json" >/dev/null; then
+    echo "尚无节点凭据文件。"
+    return 0
+  fi
   host="$(public_host)"
   for f in "${files[@]}"; do
     if [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
@@ -1737,6 +2188,17 @@ show_links() {
     print_link "$f"
     echo
   done
+  if compgen -G "$XRAY_DATA/*.json" >/dev/null; then
+    for f in "$XRAY_DATA"/*.json; do
+      if [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
+        jq --arg h "$host" '.server=$h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"; rm -f "$f.tmp"
+      fi
+      echo "===== $(basename "$f" .json) [Xray] ====="
+      jq . "$f"
+      print_link "$f"
+      echo
+    done
+  fi
   if compgen -G "$RELAY_DIR/*.json" >/dev/null; then
     echo "端口转发和中转详情：$(self_cmd) relay list"
   fi
@@ -1752,7 +2214,7 @@ status() {
 firewall_help() {
   cat <<'TXT'
 本脚本不会自动修改防火墙。请仅放行你实际使用的节点端口：
-  Reality / AnyTLS / Shadowsocks / Telegram SOCKS5：TCP
+  Reality / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
   Hysteria2 / TUIC：UDP
   端口转发：按添加时选择的 tcp / udp / both 放行
 
@@ -1791,7 +2253,8 @@ singbox-manager ${SCRIPT_VERSION}
   relay forward    添加端口转发（TCP/UDP → 目标地址:端口）
   relay list       查看中转/转发和分享链接
   relay del [名称] 删除中转/转发
-  port [名称] [新端口]  修改节点端口（UUID、密钥、密码、指纹都不变）
+  port [名称] [新端口]  修改节点端口（UUID、密钥、密码、指纹都不变；支持 Xray 节点）
+  xray [add|check|status|restart|log]  管理 Xray sidecar（首次 add 自动安装官方内核）
   fp [名称] [指纹] 修改节点的 TLS 指纹（可多个，如 chrome,firefox 或 all），每个指纹一条分享链接
   check            校验 sing-box 配置
   status           查看版本、服务状态和监听端口
@@ -1828,8 +2291,9 @@ menu() {
     echo "17) 中转 / 端口转发"
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
+    echo "20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）"
     echo "0) 退出"
-    read -r -p "选择 [0-19]: " choice || exit 0
+    read -r -p "选择 [0-20]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -1850,6 +2314,7 @@ menu() {
       17) relay_menu ;;
       18) cmd_fp ;;
       19) cmd_port ;;
+      20) xray_add_node ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -1908,6 +2373,15 @@ main() {
         *) usage; exit 2 ;;
       esac ;;
     tg|telegram|socks5) prepare_manage; add_telegram_socks ;;
+    xray) prepare_manage
+      case "${2:-status}" in
+        add|node) xray_add_node ;;
+        check) xray_prepare; xray_check_config ;;
+        status) xray_status ;;
+        restart) xray_restart_service && echo "已重启 Xray sidecar。" ;;
+        log|logs) xray_logs "${3:-100}" ;;
+        *) usage; exit 2 ;;
+      esac ;;
     fp|fingerprint) need_jq; cmd_fp "${2:-}" "${*:3}" ;;
     port) prepare_manage; cmd_port "${2:-}" "${3:-}" ;;
     links) need_jq; show_links ;;

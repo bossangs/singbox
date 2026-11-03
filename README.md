@@ -293,6 +293,9 @@ sb relay del
 | `sb relay del 名称` | 删除中转/转发 |
 | `sb port` | 修改节点端口（按提示选择） |
 | `sb port 名称 新端口` | 直接把节点改到新端口，UUID、密钥、密码、指纹都不变 |
+| `sb xray add` | 添加 Xray VLESS + TLS 节点，默认 XHTTP auto |
+| `sb xray status` / `sb xray log` | 查看 Xray sidecar 状态和日志 |
+| `sb xray check` / `sb xray restart` | 校验或重启 Xray sidecar |
 | `sb fp` | 查看并修改节点的 TLS 指纹 |
 | `sb fp 名称 chrome,firefox` | 把节点设为这几个指纹，每个指纹一条分享链接（`all` 表示全部可用指纹） |
 | `sb check` | 校验 sing-box 配置 |
@@ -308,18 +311,27 @@ sb relay del
 
 如果 `/usr/local/bin/sb` 已经被别的程序占用，脚本不会覆盖它，会提示你改用 `./singbox-manager.sh` 加上面的命令，例如 `./singbox-manager.sh links`。
 
+## Xray VLESS + TLS（默认 XHTTP）
+
+脚本保留现有 sing-box 节点，并额外通过独立的 Xray sidecar 提供 VLESS + TLS。首次运行 `sb xray add` 或选择菜单“添加 VLESS + TLS”时，脚本会从 Xray 官方 GitHub Releases 下载适合本机架构的内核并核验 SHA-256；它不会覆盖系统已有的 Xray 二进制、服务或配置。
+
+默认传输为 XHTTP `mode=auto`，也可以选择 RAW/TCP、WebSocket、gRPC 或 HTTPUpgrade。上游已将后三种传输标记为弃用，优先建议使用 XHTTP。脚本为每个节点生成独立的自签证书，并把证书 SHA-256 pin（分享链接的 `pcs` 参数）写进 VLESS 链接；这与关闭证书验证不同。导入端需支持 Xray 分享链接提案里的 `pcs` 参数，否则应改用受信任证书或在客户端手动配置证书指纹，不要盲目启用 insecure。
+
+Xray 节点使用独立 TCP 端口，脚本不会自动改防火墙。创建节点后，按屏幕提示在系统防火墙和云安全组放行该 TCP 端口。安装步骤、支持方式与排查命令见 [Xray/XHTTP 安装说明](INSTALL_XRAY_CN.md)。
+
 ## 更新脚本
 
 ```bash
 sb update
 ```
 
+如果本地脚本版本比远端公开版本新，更新命令会拒绝降级，以免丢失尚未公开的本地功能；本地 Xray 构建请使用对应安装包更新。
+
 ## 从旧版本升级（已经装过本脚本的服务器）
 
-旧版本没有 `sb`，而且如果当时在 IP 提示处直接回车，分享链接里会是 `YOUR_SERVER_IP`。下载新版并重新运行一次 `install` 就会：创建 `sb`、清理官方示例节点、保留你已有的节点（服务会重启一下）：
+旧版本没有 `sb`，而且如果当时在 IP 提示处直接回车，分享链接里会是 `YOUR_SERVER_IP`。使用本地安装包中的脚本重新运行 `install`，会创建 `sb`、清理官方示例节点并保留你已有的节点（服务会重启一下）。要安装含 Xray 功能的当前本地版本，请按 [Xray/XHTTP 安装说明](INSTALL_XRAY_CN.md) 使用安装包；不要从尚未更新的公开分支下载脚本。
 
 ```bash
-curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
 ```
@@ -403,7 +415,7 @@ systemctl disable --now caddy
 
 脚本**不会**自动修改防火墙，你需要只放行实际使用的端口：
 
-- Reality / AnyTLS / Shadowsocks / Telegram SOCKS5：TCP
+- Reality / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
 - Hysteria2 / TUIC：UDP
 - 端口转发：按添加时选择的 `tcp` / `udp` / `both` 放行
 
@@ -434,6 +446,8 @@ nft list ruleset
 
 - **官方示例节点**：sing-box 官方安装包（deb 和 apk 都一样）会附带一个示例配置，里面有一个监听 8080 端口的 Shadowsocks 节点，密码是公开的。本脚本在安装和打开菜单时会先备份配置，再把这个示例节点移除。
 - **自签证书**：Hysteria2、TUIC、AnyTLS 共用一张自签证书（`/etc/sing-box/certs/`，RSA 2048，有效期 825 天），只在第一次需要时生成。客户端需要开启“允许不安全证书 / insecure”，分享链接里已经带上这个参数。
+- **Xray 自签证书**：每个 Xray VLESS + TLS 节点独立生成 RSA 2048 自签证书（有效期 825 天），并在链接中使用 `pcs` 做 SHA-256 pin；不使用 `allowInsecure`。
+- **Xray sidecar 文件**：二进制 `/usr/local/bin/singbox-xray`，配置 `/etc/singbox-xray/config.json`，服务名 `singbox-xray`，证书与节点元数据存放在 `/etc/singbox-xray/`。这些路径与本脚本的 sing-box 配置相互独立。
 - **AnyTLS 链接格式**：不同客户端对 `anytls://` 链接的参数要求可能不一样，导入前请对照客户端文档。
 - **凭据文件**：`/etc/sing-box/manager/*.json` 包含节点密码等敏感信息，只有 root 可读，请勿外传。中转记录里也保存了落地节点的信息。
 - **自动备份**：每次添加或删除节点、中转、转发前，旧配置都会备份到 `/var/backups/sing-box-manager/config-时间戳.json`。
@@ -453,6 +467,12 @@ nft list ruleset
 | `/etc/init.d/sing-box` | Alpine：OpenRC 服务（优先使用官方 apk 包自带的，没有时由脚本创建） |
 | `/etc/conf.d/sing-box` | Alpine：OpenRC 服务设置（脚本在这里加上日志文件位置） |
 | `/var/log/sing-box.log` | Alpine：sing-box 日志 |
+| `/usr/local/bin/singbox-xray` | Xray sidecar 内核（首次添加 Xray 节点时安装） |
+| `/etc/singbox-xray/config.json` | Xray 入站配置 |
+| `/etc/singbox-xray/manager/` | Xray 节点元数据（root only） |
+| `/etc/singbox-xray/certs/` | Xray 节点自签证书和私钥 |
+| `/etc/systemd/system/singbox-xray.service` / `/etc/init.d/singbox-xray` | Xray sidecar 服务文件 |
+| `/var/backups/singbox-xray/` | Xray 配置备份 |
 
 ## 常用排查命令
 
@@ -460,6 +480,14 @@ nft list ruleset
 
 ```bash
 sb status
+```
+
+查看 Xray sidecar：
+
+```bash
+sb xray status
+sb xray log
+sb xray check
 ```
 
 ```bash
