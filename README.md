@@ -86,7 +86,10 @@ Telegram: https://t.me/o2oyww
 18) 修改节点 TLS 指纹（多指纹分享链接）
 19) 修改节点端口
 20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）
-21) 批量添加全部 7 类节点并输出 Base64 汇总（不含 Telegram）
+21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64
+22) 自动选择并启用服务器 TCP BBR（需要确认）
+23) 查看管理脚本/节点数据/备份/日志占用
+24) 节点服务保活/看门狗（启用/状态/检查/停用）
 0) 退出
 ```
 
@@ -104,7 +107,16 @@ Telegram: https://t.me/o2oyww
 
 管理菜单选 **21**，或运行 `sb add-all`，可以按顺序新增本脚本支持的全部 7 类节点：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5，以及 Xray VLESS + TLS（默认 XHTTP auto）。开始前会要求输入 `y` 确认；随后沿用各协议原有的添加流程，逐项询问需要的名称、端口、TLS 域名或传输参数，并在每个节点创建成功后立即显示它的分享链接。第一次创建 Xray 节点时会额外安装独立的 Xray sidecar。
 
-七类节点全部创建成功后，脚本还会把本次新建的非 Telegram 节点分享链接（VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Xray VLESS + TLS；多指纹会分别包含）按行合并并 Base64 编码，最后输出一条可复制的导入内容。Telegram SOCKS5 的 `tg://` 和 `https://t.me` 链接不放进这条内容。它只是终端里显示的一段文本，不是公网 URL，也不会部署订阅服务。
+七类节点全部创建成功后，脚本会输出两条按客户端分组的 Base64 内容，解码后每行是一条分享链接：
+
+- **v2rayNG**：VLESS + Reality、Shadowsocks。
+- **NekoBox / sing-box**：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks。Reality 和 Shadowsocks 会同时出现在两组中。
+
+Telegram SOCKS5 不进入任何一组。Xray VLESS + TLS/XHTTP 也暂不放入两组：NekoBox 官方项目仍未提供稳定的 XHTTP 支持；v2rayNG 虽使用 Xray core，但它的分享链接导入不支持本脚本用于自签证书校验的 `pcs` pin，不能安全地直接导入该节点。脚本不会把它改成跳过证书验证的链接。
+
+Hysteria2 只放进 NekoBox / sing-box 组；本脚本用自签证书，因此链接带 `insecure=1`。sing-box 将 `insecure` 定义为接受任意服务器证书，请妥善保管节点凭据，并了解这会降低证书校验强度。两条 Base64 都只是终端显示的文本，不是公网 URL，也不会部署订阅服务。
+
+兼容性依据：[v2rayNG 官方仓库](https://github.com/2dust/v2rayNG)说明其使用 Xray / v2fly core；[Xray 出站协议列表](https://xtls.github.io/en/config/outbound.html)未列出 Hysteria2、TUIC 或 AnyTLS；v2rayNG 的 [`pinSHA256` 支持请求](https://github.com/2dust/v2rayNG/issues/4148)已被维护者标记为“不计划”。[NekoBox 官方协议列表](https://github.com/MatsuriDayo/NekoBoxForAndroid)包含 Hysteria2、TUIC 和 AnyTLS，而其 [XHTTP 支持请求](https://github.com/MatsuriDayo/NekoBoxForAndroid/issues/1087)仍未解决；[sing-box TLS 文档](https://sing-box.sagernet.org/configuration/shared/tls/)说明 `insecure` 会接受任意证书。
 
 每类节点分别保存和校验，不是一个整体事务：如果某一步失败，先前成功创建的节点会保留，后面的协议不会继续添加。脚本不会自动开放端口；请按每个节点显示的协议和端口，在系统防火墙及云安全组中放行。
 
@@ -294,7 +306,11 @@ sb relay del
 | --- | --- |
 | `sb` | 打开管理菜单 |
 | `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
-| `sb add-all` | 逐项新增全部 7 类协议节点，最后输出非 Telegram 链接的 Base64 导入内容 |
+| `sb add-all` | 逐项新增全部 7 类节点，最后输出 v2rayNG 与 NekoBox/sing-box 两组 Base64 内容 |
+| `sb bbr` | 自动选择内核支持的标准 TCP BBR；确认后应用并持久化 |
+| `sb bbr status` / `sb bbr reset` | 查看 BBR 状态，或恢复修改前的拥塞控制算法 |
+| `sb storage` / `sb disk` | 统计管理器相关脚本、节点数据、备份和日志占用（只读） |
+| `sb watchdog enable/status/check/disable` | 手动启用、查看、立即检查修复或停用节点服务看门狗 |
 | `sb links` | 查看所有节点的参数和分享链接 |
 | `sb host` | 修改服务器地址并重新生成分享链接 |
 | `sb relay` | 中转 / 端口转发菜单 |
@@ -316,11 +332,39 @@ sb relay del
 | `sb firewall` | 查看防火墙放行说明 |
 | `sb update` | 从本仓库下载最新版脚本并更新 `sb` |
 | `sb shortcut` | 创建或刷新 `sb` 快捷命令 |
-| `sb remove-shortcut` | 删除 `sb` 快捷命令（不影响 sing-box 和节点） |
+| `sb remove-shortcut` | 删除 `sb` 快捷命令（看门狗启用时需先停用） |
 | `sb version` | 显示脚本版本 |
 | `sb help` | 显示帮助 |
 
 如果 `/usr/local/bin/sb` 已经被别的程序占用，脚本不会覆盖它，会提示你改用 `./singbox-manager.sh` 加上面的命令，例如 `./singbox-manager.sh links`。
+
+## 服务器 TCP BBR
+
+管理菜单选 **22**，或运行 `sudo sb bbr`。这是服务器级 TCP 设置，不属于任何节点协议。脚本检查内核的 `tcp_available_congestion_control`，仅在标准算法 `bbr` 已注册时选择它；若不可用就保持原设置，不会下载或安装内核模块，也不会自动启用定制的 BBR2/BBR3。更换算法前会要求确认，并记下原算法；`sudo sb bbr status` 查看状态，`sudo sb bbr reset` 确认后恢复原算法并移除脚本写入的配置。
+
+持久化位置是 systemd 的 `/etc/sysctl.d/` 与 `/etc/modules-load.d/`，或 OpenRC 的 `/etc/sysctl.conf` 与 `/etc/modules`。BBR 对不同网络路径的收益并不相同，内核是否支持也不代表它在所有环境里都一定最快；这个自动选择依据内核注册状态，不会跑吞吐基准测试。为避免改动所有接口的队列行为，脚本不更改默认 qdisc；[Linux 上游 BBR 实现](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_bbr.c)说明 BBR 可与 `fq` 配合，未使用时会由 TCP 内部 pacing 处理。
+
+## 管理器占用空间统计
+
+管理菜单选 **23**，或运行 `sudo sb storage`（`sudo sb disk` 也可）。统计按 `du -sk` 的已分配空间估算，分别列出管理脚本/快捷命令/服务文件、`/etc/sing-box` 节点配置和证书、Xray sidecar 配置/证书/内核、管理器备份、管理器日志，并给出合计。它只读取这些指定路径，不扫描整个系统、不包括 sing-box 主程序和操作系统文件，也不会删除或修改内容。
+
+## 节点服务保活/看门狗
+
+这是**可选功能**，安装脚本和新增节点流程都不会自动启用。管理菜单选 **24**，也可用以下命令：
+
+```bash
+sudo sb watchdog enable
+sudo sb watchdog status
+sudo sb watchdog check
+sudo sb watchdog disable
+```
+
+启用后，systemd 或 OpenRC 会监督 sing-box 和本脚本管理的 Xray sidecar。每分钟检查仍在运行的服务是否监听配置中的节点端口；若服务仍处于 active/running、但端口丢失，就尝试重启并再次核验。检查配置失败时不会盲目重启。已被管理员手动停止的服务会被跳过，不会自动启动；`check` 可手动立即执行同一检查和修复。
+
+- **Debian / Ubuntu（systemd）**：仅在看门狗启用后，为 sing-box 及已安装的本脚本 Xray 服务增加 `Restart=always` 和无限启动重试设置，并每分钟运行一次健康检查。启用或停用时不重启节点服务；`systemctl stop` 的手动停服行为仍会被尊重。
+- **Alpine（OpenRC）**：启用后安装一个独立的 OpenRC 看门狗服务，并监视仍在运行的节点端口。Alpine 官方 sing-box 服务默认最多自动重生 10 次；启用时会在 `/etc/conf.d/sing-box` 追加有独立标记的 `respawn_max=0`（无限重生）配置。若官方服务当时正在运行，脚本会先征求同意，再短暂重启一次以应用该设置。停用会移除管理器自己的监控服务与配置块；若官方服务正在运行且需要恢复原重生上限，脚本会提示并确认一次短暂重启。
+
+当配置错误导致服务无法启动时，systemd/OpenRC 的自动重试可能持续发生；请先修复配置，或运行 `sudo sb watchdog disable` 停用。看门狗检查的是本机进程和监听端口，不代表公网可达，也不会检测云安全组、防火墙、DNS 或端到端网络。它无法防止管理员强制停服、主机断电、内核/服务管理器故障，也不能保证修复配置错误或端口被其他程序占用。参考：[systemd 服务重启语义](https://www.freedesktop.org/software/systemd/man/systemd.service.html)、[systemd 启动频率限制](https://www.freedesktop.org/software/systemd/man/systemd.unit.html)、[OpenRC `supervise-daemon`](https://github.com/OpenRC/openrc/blob/master/supervise-daemon-guide.md) 和 [Alpine 官方 sing-box 服务文件](https://gitlab.alpinelinux.org/alpine/aports/-/raw/master/community/sing-box/sing-box.initd)。
 
 ## Xray VLESS + TLS（默认 XHTTP）
 
@@ -476,13 +520,15 @@ nft list ruleset
 | `/var/backups/sing-box-manager/` | 配置备份 |
 | `/etc/systemd/system/sing-box.service` | Debian：systemd 服务（只在官方安装包没有提供时才由脚本创建） |
 | `/etc/init.d/sing-box` | Alpine：OpenRC 服务（优先使用官方 apk 包自带的，没有时由脚本创建） |
-| `/etc/conf.d/sing-box` | Alpine：OpenRC 服务设置（脚本在这里加上日志文件位置） |
+| `/etc/conf.d/sing-box` | Alpine：OpenRC 服务设置（含日志位置；看门狗启用时可加 `respawn_max=0` 管理块） |
 | `/var/log/sing-box.log` | Alpine：sing-box 日志 |
 | `/usr/local/bin/singbox-xray` | Xray sidecar 内核（首次添加 Xray 节点时安装） |
 | `/etc/singbox-xray/config.json` | Xray 入站配置 |
 | `/etc/singbox-xray/manager/` | Xray 节点元数据（root only） |
 | `/etc/singbox-xray/certs/` | Xray 节点自签证书和私钥 |
 | `/etc/systemd/system/singbox-xray.service` / `/etc/init.d/singbox-xray` | Xray sidecar 服务文件 |
+| `/etc/systemd/system/singbox-manager-watchdog.*` / `/etc/init.d/singbox-manager-watchdog` | 可选看门狗服务与定时检查（仅启用后创建） |
+| `/var/log/singbox-manager-watchdog.log` | Alpine：看门狗日志（仅启用后创建） |
 | `/var/backups/singbox-xray/` | Xray 配置备份 |
 
 ## 常用排查命令

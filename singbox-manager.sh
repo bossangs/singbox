@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.03.4"
+SCRIPT_VERSION="2026.11.03.7"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -40,6 +40,23 @@ OPENRC_INIT="/etc/init.d/sing-box"
 OPENRC_CONFD="/etc/conf.d/sing-box"
 SB_LOG="/var/log/sing-box.log"
 INIT_SYS=""   # systemd / openrc / none
+BBR_MARK_BEGIN="# @bossangs-singbox-manager-tcp-bbr BEGIN"
+BBR_MARK_END="# @bossangs-singbox-manager-tcp-bbr END"
+BBR_STATE_MARKER="# @bossangs-singbox-manager-tcp-bbr STATE"
+BBR_STATE="$DATA/.tcp-bbr-state"
+BBR_CC_FILE="/proc/sys/net/ipv4/tcp_congestion_control"
+BBR_AVAILABLE_FILE="/proc/sys/net/ipv4/tcp_available_congestion_control"
+WATCHDOG_MARK="# @bossangs-singbox-manager-watchdog"
+WATCHDOG_CONF_BEGIN="# @bossangs-singbox-manager-watchdog BEGIN"
+WATCHDOG_CONF_END="# @bossangs-singbox-manager-watchdog END"
+WATCHDOG_SERVICE="singbox-manager-watchdog"
+WATCHDOG_TIMER="singbox-manager-watchdog.timer"
+WATCHDOG_SYSTEMD_SERVICE="/etc/systemd/system/singbox-manager-watchdog.service"
+WATCHDOG_SYSTEMD_TIMER="/etc/systemd/system/singbox-manager-watchdog.timer"
+WATCHDOG_SINGBOX_DROPIN="/etc/systemd/system/sing-box.service.d/90-singbox-manager-watchdog.conf"
+WATCHDOG_XRAY_DROPIN="/etc/systemd/system/singbox-xray.service.d/90-singbox-manager-watchdog.conf"
+WATCHDOG_OPENRC_INIT="/etc/init.d/singbox-manager-watchdog"
+WATCHDOG_LOG="/var/log/singbox-manager-watchdog.log"
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo -i"; }
@@ -171,7 +188,7 @@ cmd_update() {
   oldest="$(printf '%s\n%s\n' "$new_ver" "$SCRIPT_VERSION" | sort -V | head -n1)"
   if [[ "$oldest" == "$new_ver" && "$new_ver" != "$SCRIPT_VERSION" ]]; then
     rm -f "$tmp"
-    echo "未更新：本地构建 $SCRIPT_VERSION 比远端 $new_ver 新，包含尚未发布的 Xray 功能；为避免回退，未覆盖 sb。"
+    echo "未更新：本地构建 $SCRIPT_VERSION 比远端 $new_ver 新，包含尚未发布的本地功能；为避免回退，未覆盖 sb。"
     echo "要保留此功能，请从本地安装包更新；后续发布版本后再使用 sb update。"
     return 0
   fi
@@ -180,6 +197,10 @@ cmd_update() {
   echo "已更新 sb：${SCRIPT_VERSION} -> ${new_ver:-未知}。运行 sb 打开管理菜单。"
 }
 cmd_remove_shortcut() {
+  if watchdog_file_owned "$WATCHDOG_SYSTEMD_TIMER" || watchdog_file_owned "$WATCHDOG_OPENRC_INIT"; then
+    echo "看门狗正在使用 sb 快捷命令；请先运行 sb watchdog disable，再删除快捷命令。" >&2
+    return 1
+  fi
   if shortcut_is_ours; then
     rm -f "$SHORTCUT"
     echo "已删除 sb 快捷命令（sing-box 和节点不受影响）。"
@@ -1449,23 +1470,29 @@ print_link() {
     *) echo "（未知协议 $proto，无法生成分享链接）" ;;
   esac
 }
-print_import_payload() {
-  # 将传入节点的 URI 按行合并后 Base64 编码；仅输出客户端协议链接，自动排除 Telegram 深链。
-  local f tmp encoded
+print_client_payload() {
+  # $1 客户端组；按核心支持情况筛选 URI，然后按行合并并 Base64 编码。
+  local client="$1" f proto tmp encoded
+  shift
   tmp="$(mktemp)"
   for f in "$@"; do
+    proto="$(jq -r '.protocol // empty' "$f")"
+    case "$client:$proto" in
+      "v2rayNG:VLESS + Reality"|"v2rayNG:Shadowsocks") ;;
+      "NekoBox/sing-box:VLESS + Reality"|"NekoBox/sing-box:Hysteria2"|"NekoBox/sing-box:TUIC"|"NekoBox/sing-box:AnyTLS"|"NekoBox/sing-box:Shadowsocks") ;;
+      *) continue ;;
+    esac
     print_link "$f" | grep -E '^(vless|hysteria2|hy2|tuic|anytls|ss)://' >>"$tmp" || true
   done
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
-    echo "没有可合并的非 Telegram 分享链接。"
+    echo "$client：没有符合兼容性筛选条件的分享链接。"
     return 0
   fi
   encoded="$(base64 <"$tmp" | tr -d '\r\n')"
   rm -f "$tmp"
   echo
-  echo "以下是新建非 Telegram 节点的 Base64 导入内容（每条分享链接按一行编码，复制整行）："
-  echo "这是文本内容，不是公网订阅 URL；脚本没有创建或部署订阅地址。"
+  echo "[$client] Base64 导入内容（每条分享链接按一行编码，复制整行）："
   printf '%s\n' "$encoded"
 }
 save_node() {
@@ -1698,7 +1725,10 @@ TXT
   xray_add_node
   created_files+=("$XRAY_DATA/$LAST_TAG.json")
   echo "全部 7 类节点均已创建，以上已逐项显示分享链接。"
-  print_import_payload "${created_files[@]}"
+  print_client_payload "v2rayNG" "${created_files[@]}"
+  print_client_payload "NekoBox/sing-box" "${created_files[@]}"
+  echo "Telegram SOCKS5 与 Xray VLESS + TLS/XHTTP 均未放入这两组：前者不纳入聚合；后者的自签证书 pcs pin 不能由 v2rayNG 当前导入流程可靠识别，NekoBox/sing-box 当前也无稳定的 XHTTP 支持。"
+  echo "以上是本机终端中的 Base64 文本，不是公网订阅 URL；脚本不会创建或部署订阅地址。"
 }
 
 # ---------- 中转：解析落地节点分享链接 ----------
@@ -2309,6 +2339,532 @@ Alpine 通常没有 UFW，默认也不拦截入站；如果自己配置了 iptab
 先确认 SSH 端口已放行，避免失去连接。
 TXT
 }
+bbr_set_paths() {
+  case "${1:-$INIT_SYS}" in
+    systemd)
+      BBR_SYSCTL_FILE="/etc/sysctl.d/99-singbox-manager-tcp-bbr.conf"
+      BBR_MODULES_FILE="/etc/modules-load.d/99-singbox-manager-tcp-bbr.conf" ;;
+    openrc)
+      BBR_SYSCTL_FILE="/etc/sysctl.conf"
+      BBR_MODULES_FILE="/etc/modules" ;;
+    *) return 1 ;;
+  esac
+}
+bbr_write_block() {
+  local file="$1" content="$2" dir tmp begin_count=0 end_count=0 mode=600
+  [[ ! -L "$file" ]] || { echo "拒绝修改符号链接配置：$file" >&2; return 1; }
+  [[ ! -e "$file" || -f "$file" ]] || { echo "不是普通文件：$file" >&2; return 1; }
+  dir="$(dirname -- "$file")"
+  mkdir -p -- "$dir" || return 1
+  if [[ -f "$file" ]]; then
+    begin_count="$(grep -Fxc -- "$BBR_MARK_BEGIN" "$file" || true)"
+    end_count="$(grep -Fxc -- "$BBR_MARK_END" "$file" || true)"
+    [[ "$begin_count" == "$end_count" && ( "$begin_count" == 0 || "$begin_count" == 1 ) ]] || {
+      echo "配置标记不完整或重复，拒绝改动：$file" >&2; return 1;
+    }
+    mode="$(stat -c '%a' "$file" 2>/dev/null || echo 600)"
+  fi
+  tmp="$(mktemp "$dir/.sb-bbr.XXXXXX")" || return 1
+  if [[ -f "$file" ]]; then
+    awk -v begin="$BBR_MARK_BEGIN" -v end="$BBR_MARK_END" '
+      $0 == begin { inside=1; next }
+      $0 == end { inside=0; next }
+      !inside { print }
+    ' "$file" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  fi
+  [[ ! -s "$tmp" ]] || printf '\n' >>"$tmp"
+  printf '%s\n%s\n%s\n' "$BBR_MARK_BEGIN" "$content" "$BBR_MARK_END" >>"$tmp"
+  chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+}
+bbr_remove_block() {
+  local file="$1" tmp begin_count=0 end_count=0 mode=600
+  [[ -e "$file" ]] || return 0
+  [[ ! -L "$file" && -f "$file" ]] || { echo "拒绝修改非普通文件：$file" >&2; return 1; }
+  begin_count="$(grep -Fxc -- "$BBR_MARK_BEGIN" "$file" || true)"
+  end_count="$(grep -Fxc -- "$BBR_MARK_END" "$file" || true)"
+  [[ "$begin_count" == 0 && "$end_count" == 0 ]] && return 0
+  [[ "$begin_count" == 1 && "$end_count" == 1 ]] || { echo "配置标记不完整或重复：$file" >&2; return 1; }
+  mode="$(stat -c '%a' "$file" 2>/dev/null || echo 600)"
+  tmp="$(mktemp "$(dirname -- "$file")/.sb-bbr.XXXXXX")" || return 1
+  awk -v begin="$BBR_MARK_BEGIN" -v end="$BBR_MARK_END" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
+    !inside { print }
+  ' "$file" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+}
+bbr_state_valid() {
+  [[ -f "$BBR_STATE" && ! -L "$BBR_STATE" ]] && [[ "$(head -n1 "$BBR_STATE" 2>/dev/null)" == "$BBR_STATE_MARKER" ]]
+}
+bbr_state_value() { sed -n "s/^$1=//p" "$BBR_STATE" | head -n1; }
+bbr_write_state() {
+  local previous="$1" init="$2" tmp
+  mkdir -p -- "$DATA" || return 1
+  tmp="$(mktemp "$DATA/.tcp-bbr-state.XXXXXX")" || return 1
+  printf '%s\nprevious=%s\ninit=%s\n' "$BBR_STATE_MARKER" "$previous" "$init" >"$tmp"
+  if chmod 600 "$tmp" && mv -f -- "$tmp" "$BBR_STATE"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+cmd_bbr_status() {
+  local available current
+  [[ -r "$BBR_CC_FILE" && -r "$BBR_AVAILABLE_FILE" ]] || { echo "内核未提供 TCP 拥塞控制 sysctl 接口。"; return 0; }
+  current="$(cat "$BBR_CC_FILE")"
+  available="$(cat "$BBR_AVAILABLE_FILE")"
+  echo "当前 TCP 拥塞控制算法：$current"
+  echo "内核已注册算法：${available:-（无）}"
+  if bbr_state_valid; then
+    echo "管理器持久化：已启用（原算法：$(bbr_state_value previous)；init：$(bbr_state_value init)）"
+  else
+    echo "管理器持久化：未启用"
+  fi
+  if bbr_set_paths "$INIT_SYS" && [[ -f "$BBR_SYSCTL_FILE" ]] && grep -Fq -- "$BBR_MARK_BEGIN" "$BBR_SYSCTL_FILE"; then
+    echo "BBR 配置位置：$BBR_SYSCTL_FILE"
+  fi
+  echo "默认队列规则未由管理器修改。"
+}
+cmd_bbr_apply() {
+  local available current previous init_saved state_created=0 module_file sysctl_file answer
+  need_root
+  [[ -r "$BBR_CC_FILE" && -r "$BBR_AVAILABLE_FILE" ]] || { echo "内核未提供 TCP 拥塞控制接口；未作修改。"; return 0; }
+  available="$(cat "$BBR_AVAILABLE_FILE")"
+  if ! grep -qw -- bbr <<<"$available"; then
+    echo "内核当前未注册标准 TCP BBR（bbr）；没有修改任何设置。"
+    echo "内核已注册算法：${available:-（无）}"
+    if grep -Eqw 'bbr2|bbr3' <<<"$available"; then echo "检测到非标准/定制 BBR 变体；自动模式不会擅自启用。"; fi
+    return 0
+  fi
+  [[ "$INIT_SYS" == systemd || "$INIT_SYS" == openrc ]] || { echo "未识别 systemd/OpenRC；无法安全配置开机持久化。"; return 0; }
+  current="$(cat "$BBR_CC_FILE")"
+  if [[ -e "$BBR_STATE" ]]; then
+    bbr_state_valid || { echo "BBR 状态文件存在但标记无效：$BBR_STATE"; return 0; }
+    init_saved="$(bbr_state_value init)"
+    [[ "$init_saved" == "$INIT_SYS" ]] || { echo "系统 init 与上次 BBR 设置不一致；请先使用原 init 环境执行 sb bbr reset。"; return 0; }
+  else
+    previous="$current"
+  fi
+  bbr_set_paths "$INIT_SYS" || { echo "无法确定 sysctl 配置位置。"; return 0; }
+  sysctl_file="$BBR_SYSCTL_FILE"; module_file="$BBR_MODULES_FILE"
+  echo "自动选择：内核已注册标准算法 bbr。"
+  echo "当前算法：$current"
+  echo "将把 tcp_congestion_control 设为 bbr，并写入开机配置：$sysctl_file"
+  echo "将登记 tcp_bbr 模块以便启动时可用：$module_file"
+  echo "不会修改队列规则、其他 sysctl、防火墙或 sing-box/Xray 服务。"
+  if ! read -r -p "确认应用这项系统级 TCP 设置？[y/N]: " answer || [[ ! "${answer,,}" =~ ^(y|yes)$ ]]; then
+    echo "已取消，系统设置未更改。"; return 0
+  fi
+  if ! bbr_state_valid; then
+    bbr_write_state "$previous" "$INIT_SYS" || { echo "无法保存原算法状态；未继续。"; return 0; }
+    state_created=1
+  fi
+  if ! bbr_write_block "$module_file" "tcp_bbr"; then
+    (( state_created )) && rm -f -- "$BBR_STATE"
+    echo "无法写入模块加载配置；未继续。"; return 0
+  fi
+  if ! bbr_write_block "$sysctl_file" "net.ipv4.tcp_congestion_control = bbr"; then
+    if (( state_created )); then bbr_remove_block "$module_file" || true; rm -f -- "$BBR_STATE"; fi
+    echo "无法写入 sysctl 配置；未继续。"; return 0
+  fi
+  if ! printf '%s\n' bbr >"$BBR_CC_FILE"; then
+    if (( state_created )); then
+      bbr_remove_block "$sysctl_file" || true; bbr_remove_block "$module_file" || true; rm -f -- "$BBR_STATE"
+    fi
+    echo "无法应用运行时算法；请检查内核权限和状态文件。"; return 0
+  fi
+  echo "TCP 拥塞控制已切换为 bbr，并已写入开机配置。运行 sb bbr status 查看，运行 sb bbr reset 恢复原算法。"
+}
+cmd_bbr_reset() {
+  local previous saved_init available current answer
+  need_root
+  if ! bbr_state_valid; then
+    [[ ! -e "$BBR_STATE" ]] && echo "没有由管理器创建的 BBR 状态；未作修改。" || echo "BBR 状态文件无效：$BBR_STATE"
+    return 0
+  fi
+  previous="$(bbr_state_value previous)"; saved_init="$(bbr_state_value init)"
+  [[ "$previous" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "备份的原算法名称无效；未作修改。"; return 0; }
+  [[ "$saved_init" == systemd || "$saved_init" == openrc ]] || { echo "备份的系统类型无效；未作修改。"; return 0; }
+  [[ -r "$BBR_CC_FILE" && -r "$BBR_AVAILABLE_FILE" ]] || { echo "内核未提供 TCP 拥塞控制接口；状态保留。"; return 0; }
+  available="$(cat "$BBR_AVAILABLE_FILE")"; current="$(cat "$BBR_CC_FILE")"
+  if ! grep -qw -- "$previous" <<<"$available"; then echo "原算法 $previous 当前不可用；未移除持久化设置，状态保留。"; return 0; fi
+  bbr_set_paths "$saved_init" || { echo "无法识别原配置位置；状态保留。"; return 0; }
+  echo "将恢复 TCP 算法：$current → $previous，并删除管理器添加的 BBR 配置块。"
+  if ! read -r -p "确认恢复？[y/N]: " answer || [[ ! "${answer,,}" =~ ^(y|yes)$ ]]; then echo "已取消。"; return 0; fi
+  if ! printf '%s\n' "$previous" >"$BBR_CC_FILE"; then echo "运行时算法恢复失败；状态保留。"; return 0; fi
+  if ! bbr_remove_block "$BBR_SYSCTL_FILE"; then echo "无法移除 sysctl 配置；状态保留。"; return 0; fi
+  if ! bbr_remove_block "$BBR_MODULES_FILE"; then echo "算法已恢复，但模块加载标记未移除；状态保留，请检查 $BBR_MODULES_FILE。"; return 0; fi
+  rm -f -- "$BBR_STATE"
+  echo "已恢复原 TCP 算法，并移除管理器的持久化配置。"
+}
+du_kib() {
+  local path="$1" value
+  if [[ -e "$path" || -L "$path" ]]; then
+    value="$(du -sk -- "$path" 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  else value=0; fi
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  printf '%s' "$value"
+}
+sum_du_kib() {
+  local total=0 path value
+  for path in "$@"; do value="$(du_kib "$path")"; total=$((total + value)); done
+  printf '%s' "$total"
+}
+format_du_kib() {
+  awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.2f GiB (%.0f KiB)", k/1048576, k; else if (k >= 1024) printf "%.2f MiB (%.0f KiB)", k/1024, k; else printf "%.0f KiB", k }'
+}
+cmd_storage() {
+  local script_path shortcut_path script_kib=0 service_kib sb_kib xray_kib backup_kib log_kib total
+  script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  [[ -f "$script_path" ]] || script_path=""
+  if [[ -z "$script_path" ]] && shortcut_is_ours; then script_path="$SHORTCUT"; fi
+  script_kib="$(du_kib "$script_path")"
+  if shortcut_is_ours; then
+    shortcut_path="$(readlink -f "$SHORTCUT" 2>/dev/null || printf '%s' "$SHORTCUT")"
+    [[ "$shortcut_path" == "$script_path" ]] || script_kib=$((script_kib + $(du_kib "$shortcut_path")))
+  fi
+  if [[ "$INIT_SYS" == systemd ]]; then
+    service_kib="$(sum_du_kib /etc/systemd/system/sing-box.service /etc/systemd/system/singbox-xray.service)"
+  else
+    service_kib="$(sum_du_kib "$OPENRC_INIT" "$OPENRC_CONFD" "$XRAY_INIT")"
+  fi
+  script_kib=$((script_kib + service_kib))
+  sb_kib="$(sum_du_kib "$CONF_DIR")"
+  xray_kib=$(( $(du_kib "$XRAY_DIR") + $(du_kib "$XRAY_BIN") ))
+  backup_kib="$(sum_du_kib "$BACKUP_DIR" "$XRAY_BACKUP_DIR")"
+  log_kib="$(sum_du_kib "$SB_LOG" "$XRAY_LOG")"
+  total=$((script_kib + sb_kib + xray_kib + backup_kib + log_kib))
+  echo "管理器相关磁盘占用（du -sk，按已分配空间估算；只统计下列路径）："
+  printf '  管理脚本、sb 快捷命令与服务文件：%s\n' "$(format_du_kib "$script_kib")"
+  printf '  sing-box 配置、节点元数据与证书：%s\n' "$(format_du_kib "$sb_kib")"
+  printf '  Xray sidecar 配置、节点元数据、证书与内核：%s\n' "$(format_du_kib "$xray_kib")"
+  printf '  管理器备份：%s\n' "$(format_du_kib "$backup_kib")"
+  printf '  管理器日志文件：%s\n' "$(format_du_kib "$log_kib")"
+  printf '  合计：%s\n' "$(format_du_kib "$total")"
+  echo "此统计不扫描整个系统，不包括 sing-box 主程序、操作系统或未列出的文件，也不会删除或修改任何内容。"
+}
+watchdog_file_owned() { [[ -f "$1" && ! -L "$1" ]] && grep -qxF -- "$WATCHDOG_MARK" "$1"; }
+watchdog_path_safe() {
+  local path="$1" dir="${1%/*}"
+  [[ ! -L "$dir" && ! -L "$path" ]] || { echo "看门狗路径是符号链接，为保护现有文件未操作：$path" >&2; return 1; }
+  if [[ -e "$path" ]] && ! watchdog_file_owned "$path"; then
+    echo "看门狗目标已存在且不属于本脚本，为保护现有文件未覆盖：$path" >&2
+    return 1
+  fi
+}
+watchdog_write_text() {
+  local path="$1" content="$2" dir="${1%/*}" tmp
+  watchdog_path_safe "$path" || return 1
+  mkdir -p "$dir" || return 1
+  [[ ! -L "$dir" ]] || { echo "看门狗目录是符号链接，为保护现有文件未操作：$dir" >&2; return 1; }
+  tmp="$(mktemp "$dir/.singbox-manager-watchdog.XXXXXX")" || return 1
+  if ! printf '%s\n' "$content" >"$tmp" || ! chmod 644 "$tmp" || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+watchdog_openrc_block_check() {
+  local file="$OPENRC_CONFD" begin_count end_count
+  [[ -e "$file" ]] || return 0
+  [[ -f "$file" && ! -L "$file" ]] || { echo "OpenRC 配置不是普通文件或是符号链接：$file" >&2; return 1; }
+  begin_count="$(grep -Fxc -- "$WATCHDOG_CONF_BEGIN" "$file" || true)"
+  end_count="$(grep -Fxc -- "$WATCHDOG_CONF_END" "$file" || true)"
+  [[ "$begin_count" == "$end_count" && ( "$begin_count" == 0 || "$begin_count" == 1 ) ]] || {
+    echo "OpenRC 看门狗配置标记不完整或重复：$file" >&2; return 1;
+  }
+  if [[ "$begin_count" == 1 ]]; then
+    awk -v begin="$WATCHDOG_CONF_BEGIN" -v end="$WATCHDOG_CONF_END" '
+      $0 == begin { if (state != 0) bad=1; state=1; next }
+      $0 == end { if (state != 1) bad=1; state=2; next }
+      END { if (bad || state != 2) exit 1 }
+    ' "$file" || { echo "OpenRC 看门狗标记顺序异常：$file" >&2; return 1; }
+  fi
+}
+watchdog_openrc_block_present() {
+  [[ -f "$OPENRC_CONFD" ]] && grep -Fqx -- "$WATCHDOG_CONF_BEGIN" "$OPENRC_CONFD" && grep -Fqx -- "$WATCHDOG_CONF_END" "$OPENRC_CONFD"
+}
+watchdog_write_openrc_override() {
+  local file="$OPENRC_CONFD" dir="${OPENRC_CONFD%/*}" tmp mode=644
+  watchdog_openrc_block_check || return 1
+  mkdir -p "$dir" || return 1
+  [[ ! -L "$dir" ]] || { echo "OpenRC 配置目录是符号链接：$dir" >&2; return 1; }
+  if [[ -f "$file" ]]; then mode="$(stat -c '%a' "$file" 2>/dev/null || echo 644)"; fi
+  tmp="$(mktemp "$dir/.singbox-manager-watchdog.XXXXXX")" || return 1
+  if [[ -f "$file" ]]; then
+    awk -v begin="$WATCHDOG_CONF_BEGIN" -v end="$WATCHDOG_CONF_END" '
+      $0 == begin { inside=1; next }
+      $0 == end { inside=0; next }
+      !inside { print }
+    ' "$file" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  fi
+  printf '\n%s\nrespawn_delay=3\nrespawn_max=0\n%s\n' "$WATCHDOG_CONF_BEGIN" "$WATCHDOG_CONF_END" >>"$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod "$mode" "$tmp" && mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+}
+watchdog_remove_openrc_override() {
+  local file="$OPENRC_CONFD" dir="${OPENRC_CONFD%/*}" tmp mode
+  [[ -f "$file" ]] || return 0
+  watchdog_openrc_block_check || return 1
+  watchdog_openrc_block_present || return 0
+  mode="$(stat -c '%a' "$file" 2>/dev/null || echo 644)"
+  tmp="$(mktemp "$dir/.singbox-manager-watchdog.XXXXXX")" || return 1
+  awk -v begin="$WATCHDOG_CONF_BEGIN" -v end="$WATCHDOG_CONF_END" '
+    $0 == begin { inside=1; next }
+    $0 == end { inside=0; next }
+    !inside { print }
+  ' "$file" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod "$mode" "$tmp" && mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+}
+watchdog_xray_managed() {
+  if is_openrc; then [[ -f "$XRAY_INIT" ]] && grep -qxF -- "$XRAY_MARK" "$XRAY_INIT"
+  else [[ -f "$XRAY_UNIT" ]] && grep -qxF -- "$XRAY_MARK" "$XRAY_UNIT"; fi
+}
+watchdog_singbox_ports_healthy() {
+  local rows type port net
+  [[ -r "$CONF" ]] || return 2
+  rows="$(jq -r '.inbounds[]? | select((.listen_port | type) == "number" and .listen_port > 0) | [.type // "", .listen_port, (if .type == "hysteria2" or .type == "tuic" then "udp" elif .type == "shadowsocks" or .type == "direct" then (.network // "both") else "tcp" end)] | @tsv' "$CONF" 2>/dev/null)" || return 2
+  [[ -n "$rows" ]] || return 0
+  while IFS=$'\t' read -r type port net; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    port_listening "$port" "$net" || return 1
+  done <<<"$rows"
+}
+watchdog_xray_ports_healthy() {
+  local ports port
+  [[ -r "$XRAY_CONF" ]] || return 2
+  ports="$(jq -r '.inbounds[]? | select((.port | type) == "number" and .port > 0) | .port' "$XRAY_CONF" 2>/dev/null)" || return 2
+  [[ -n "$ports" ]] || return 0
+  while IFS= read -r port; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    ss -H -lnt "( sport = :$port )" 2>/dev/null | grep -q . || return 1
+  done <<<"$ports"
+}
+watchdog_wait_singbox() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    if svc_is_running && watchdog_singbox_ports_healthy; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+watchdog_wait_xray() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    if xray_service_active && watchdog_xray_ports_healthy; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+watchdog_message() { [[ "$1" == 1 ]] || echo "$2"; }
+watchdog_check_singbox() {
+  local quiet="$1" rc
+  if ! svc_is_running; then watchdog_message "$quiet" "sing-box 当前已停止，按设计跳过，不会自动启动"; return 0; fi
+  if watchdog_singbox_ports_healthy; then watchdog_message "$quiet" "sing-box 进程与配置监听端口正常"; return 0; else rc=$?; fi
+  if (( rc == 2 )); then echo "sing-box 看门狗无法读取或解析当前配置；未重启服务。"; return 1; fi
+  echo "sing-box 服务仍处于运行状态，但至少一个配置端口未监听；正在尝试恢复。"
+  if ! svc_is_running; then watchdog_message "$quiet" "检查期间 sing-box 已停止；未主动启动。"; return 0; fi
+  svc_restart || { echo "sing-box 看门狗重启失败；请查看服务日志。"; return 1; }
+  watchdog_wait_singbox || { echo "sing-box 已重启，但监听检查仍未通过；请检查配置、端口占用和日志。"; return 1; }
+  echo "sing-box 已恢复，进程及配置监听端口正常。"
+}
+watchdog_check_xray() {
+  local quiet="$1" rc
+  watchdog_xray_managed && [[ -r "$XRAY_CONF" ]] || { watchdog_message "$quiet" "未检测到由本脚本管理的 Xray sidecar；跳过"; return 0; }
+  if ! xray_service_active; then watchdog_message "$quiet" "Xray sidecar 当前已停止，按设计跳过，不会自动启动"; return 0; fi
+  if watchdog_xray_ports_healthy; then watchdog_message "$quiet" "Xray sidecar 进程与配置 TCP 端口正常"; return 0; else rc=$?; fi
+  if (( rc == 2 )); then echo "Xray 看门狗无法读取或解析当前配置；未重启服务。"; return 1; fi
+  echo "Xray sidecar 仍处于运行状态，但至少一个配置 TCP 端口未监听；正在尝试恢复。"
+  if ! xray_service_active; then watchdog_message "$quiet" "检查期间 Xray sidecar 已停止；未主动启动。"; return 0; fi
+  xray_restart_service || { echo "Xray sidecar 看门狗重启失败；请查看服务日志。"; return 1; }
+  watchdog_wait_xray || { echo "Xray sidecar 已重启，但监听检查仍未通过；请检查配置、端口占用和日志。"; return 1; }
+  echo "Xray sidecar 已恢复，进程及配置 TCP 端口正常。"
+}
+cmd_watchdog_check() {
+  local quiet=0 failed=0
+  [[ "${1:-}" == --quiet ]] && quiet=1
+  need_jq
+  have ss || { echo "缺少 ss（iproute2），无法检查监听端口。" >&2; return 1; }
+  watchdog_check_singbox "$quiet" || failed=1
+  watchdog_check_xray "$quiet" || failed=1
+  return "$failed"
+}
+cmd_watchdog_loop() {
+  need_root
+  sleep 30
+  while :; do
+    if have jq && have ss; then cmd_watchdog_check --quiet || true
+    else echo "看门狗暂时缺少 jq 或 ss；本轮跳过端口检查。" >&2; fi
+    sleep 60
+  done
+}
+watchdog_systemd_preflight() {
+  local exec_line exec_bin
+  exec_line="$(systemctl cat "$SERVICE.service" 2>/dev/null | sed -n 's/^ExecStart=//p' | sed '/^[[:space:]]*$/d' | tail -n1 || true)"
+  case "$exec_line" in
+    "/usr/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run") ;;
+    *" run -c $CONF")
+      exec_bin="${exec_line%% *}"; exec_bin="${exec_bin#[-@+!]}"
+      [[ -x "$exec_bin" ]] && is_elf "$(readlink -f "$exec_bin" 2>/dev/null || printf '%s' "$exec_bin")" || { echo "sing-box.service 不是官方或本脚本管理的服务；为保护现有服务，未修改。" >&2; return 1; }
+      ;;
+    *) echo "找不到受支持的 sing-box.service；为保护现有服务，未修改。" >&2; return 1 ;;
+  esac
+  if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] && ! shortcut_is_ours; then echo "$SHORTCUT 已被其他程序占用；为保护现有文件，未启用看门狗。" >&2; return 1; fi
+  watchdog_path_safe "$WATCHDOG_SINGBOX_DROPIN" || return 1
+  watchdog_path_safe "$WATCHDOG_SYSTEMD_SERVICE" || return 1
+  watchdog_path_safe "$WATCHDOG_SYSTEMD_TIMER" || return 1
+  if watchdog_xray_managed; then watchdog_path_safe "$WATCHDOG_XRAY_DROPIN" || return 1; fi
+}
+watchdog_systemd_enable() {
+  local answer dropin service timer
+  watchdog_systemd_preflight || return 1
+  read -r -p "启用看门狗：systemd 将在意外退出时自动重启服务，并每分钟检查 active 服务的节点监听端口；不会启动已停止的服务。继续？[y/N]: " answer || answer=""
+  [[ "${answer,,}" =~ ^(y|yes)$ ]] || { echo "已取消，未修改看门狗配置。"; return 0; }
+  if ! shortcut_is_ours; then install_shortcut; fi
+  shortcut_is_ours || die "无法安全创建 $SHORTCUT；看门狗需要可持续调用的管理脚本"
+  printf -v dropin '%s\n' '[Unit]' 'StartLimitIntervalSec=0' '' '[Service]' 'Restart=always' 'RestartSec=3' "$WATCHDOG_MARK"
+  printf -v service '%s\n' '[Unit]' 'Description=sing-box manager node service health check' "$WATCHDOG_MARK" '' '[Service]' 'Type=oneshot' "ExecStart=$SHORTCUT watchdog check --quiet" 'TimeoutStartSec=120'
+  printf -v timer '%s\n' '[Unit]' 'Description=Check active sing-box and Xray node listeners periodically' "$WATCHDOG_MARK" '' '[Timer]' 'OnActiveSec=30s' 'OnUnitActiveSec=60s' 'AccuracySec=15s' "Unit=$WATCHDOG_SERVICE.service" '' '[Install]' 'WantedBy=timers.target'
+  watchdog_write_text "$WATCHDOG_SINGBOX_DROPIN" "$dropin" || die "无法安全写入 sing-box 看门狗 drop-in"
+  if watchdog_xray_managed; then watchdog_write_text "$WATCHDOG_XRAY_DROPIN" "$dropin" || die "无法安全写入 Xray 看门狗 drop-in"; fi
+  watchdog_write_text "$WATCHDOG_SYSTEMD_SERVICE" "$service" || die "无法写入看门狗 service"
+  watchdog_write_text "$WATCHDOG_SYSTEMD_TIMER" "$timer" || die "无法写入看门狗 timer"
+  systemctl daemon-reload
+  systemctl enable --now "$WATCHDOG_TIMER"
+  echo "看门狗已启用；节点服务未被重启。它只会在服务仍为 active、但配置端口缺失时尝试恢复。"
+}
+watchdog_openrc_init_text() {
+  local text
+  printf -v text '%s\n' '#!/sbin/openrc-run' "$WATCHDOG_MARK" "name=\"$WATCHDOG_SERVICE\"" 'description="sing-box manager node service health check"' 'supervisor="supervise-daemon"' "command=\"$SHORTCUT\"" 'command_args="watchdog loop"' "output_log=\"$WATCHDOG_LOG\"" "error_log=\"$WATCHDOG_LOG\"" 'respawn_delay=5' 'respawn_max=0' '' 'depend() {' '  after net dns' '}'
+  printf '%s' "$text"
+}
+watchdog_openrc_preflight() {
+  [[ -f "$OPENRC_INIT" ]] || { echo "找不到 OpenRC sing-box 服务文件：$OPENRC_INIT" >&2; return 1; }
+  if ! is_our_script "$OPENRC_INIT" && ! openrc_is_official "$OPENRC_INIT"; then
+    echo "sing-box OpenRC 服务不属于本脚本或官方软件包；为保护现有服务，未修改。" >&2; return 1
+  fi
+  watchdog_openrc_block_check || return 1
+  watchdog_path_safe "$WATCHDOG_OPENRC_INIT" || return 1
+  if [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] && ! shortcut_is_ours; then echo "$SHORTCUT 已被其他程序占用；为保护现有文件，未启用看门狗。" >&2; return 1; fi
+}
+watchdog_openrc_enable() {
+  local answer official=0 restart_singbox=0 conf_already=0
+  watchdog_openrc_preflight || return 1
+  if openrc_is_official "$OPENRC_INIT"; then
+    official=1
+    watchdog_openrc_block_present && conf_already=1
+    if (( ! conf_already )) && svc_is_running; then restart_singbox=1; fi
+  fi
+  if (( restart_singbox )); then
+    read -r -p "Alpine 官方 sing-box 服务需重启一次以应用无限重生设置，现有连接会短暂中断。继续启用？[y/N]: " answer || answer=""
+  else
+    read -r -p "启用 OpenRC 看门狗；它每分钟检查仍在运行的节点端口，不会启动已停止的服务。继续？[y/N]: " answer || answer=""
+  fi
+  [[ "${answer,,}" =~ ^(y|yes)$ ]] || { echo "已取消，未修改看门狗配置。"; return 0; }
+  if ! shortcut_is_ours; then install_shortcut; fi
+  shortcut_is_ours || die "无法安全创建 $SHORTCUT；看门狗需要可持续调用的管理脚本"
+  if (( official )); then watchdog_write_openrc_override || die "无法安全写入 OpenRC respawn 配置"; fi
+  watchdog_write_text "$WATCHDOG_OPENRC_INIT" "$(watchdog_openrc_init_text)" || die "无法安全写入 OpenRC 看门狗服务"
+  touch "$WATCHDOG_LOG" && chmod 600 "$WATCHDOG_LOG"
+  rc-update add "$WATCHDOG_SERVICE" default >/dev/null
+  if (( restart_singbox )); then rc-service "$SERVICE" restart || die "已写入看门狗配置，但 sing-box 重启失败；请检查服务日志"; fi
+  if ! rc-service "$WATCHDOG_SERVICE" status >/dev/null 2>&1; then rc-service "$WATCHDOG_SERVICE" start; fi
+  echo "OpenRC 看门狗已启用；不会启动处于 stopped 状态的 sing-box/Xray 服务。"
+}
+cmd_watchdog_enable() {
+  need_init
+  need_jq
+  have ss || die "缺少 ss（iproute2），无法检查监听端口；请先运行 sb install"
+  if is_openrc; then watchdog_openrc_enable; else
+    watchdog_systemd_enable
+  fi
+}
+cmd_watchdog_status() {
+  local unit active restart limit timer_state timer_enabled
+  need_init
+  echo "=== 节点服务看门狗 ==="
+  if [[ "$INIT_SYS" == systemd ]]; then
+    if watchdog_file_owned "$WATCHDOG_SYSTEMD_TIMER"; then
+      timer_state="$(systemctl is-active "$WATCHDOG_TIMER" 2>/dev/null || true)"
+      timer_enabled="$(systemctl is-enabled "$WATCHDOG_TIMER" 2>/dev/null || true)"
+      printf '定时健康检查：状态=%s，开机启用=%s\n' "${timer_state:-unknown}" "${timer_enabled:-unknown}"
+    else
+      echo "定时健康检查：未启用"
+    fi
+    for unit in "$SERVICE.service" "$XRAY_SERVICE.service"; do
+      [[ "$unit" == "$SERVICE.service" ]] || watchdog_xray_managed || continue
+      systemctl cat "$unit" >/dev/null 2>&1 || continue
+      active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+      restart="$(systemctl show "$unit" -p Restart --value 2>/dev/null || true)"
+      limit="$(systemctl show "$unit" -p StartLimitIntervalUSec --value 2>/dev/null || true)"
+      printf '  %s：状态=%s，Restart=%s，启动限速间隔=%s\n' "$unit" "${active:-unknown}" "${restart:-unknown}" "${limit:-unknown}"
+    done
+  else
+    if watchdog_file_owned "$WATCHDOG_OPENRC_INIT" && rc-service "$WATCHDOG_SERVICE" status >/dev/null 2>&1; then echo "定时健康检查：运行中（每分钟检查）"
+    else echo "定时健康检查：未启用或未运行"; fi
+    if is_our_script "$OPENRC_INIT"; then echo "  sing-box 进程监督：本脚本服务配置为 supervise-daemon / respawn_max=0"
+    elif openrc_is_official "$OPENRC_INIT"; then
+      if watchdog_openrc_block_present; then echo "  sing-box 进程监督：官方 supervise-daemon，管理器覆盖为 respawn_max=0"
+      else echo "  sing-box 进程监督：官方 supervise-daemon；当前使用发行版默认重生上限"; fi
+    fi
+    if watchdog_xray_managed; then echo "  Xray 进程监督：本脚本服务配置为 supervise-daemon / respawn_max=0"; fi
+    if svc_is_running; then echo "  sing-box：运行中"; else echo "  sing-box：已停止"; fi
+    if watchdog_xray_managed; then if xray_service_active; then echo "  Xray sidecar：运行中"; else echo "  Xray sidecar：已停止"; fi; fi
+  fi
+  echo "检查只针对仍处于运行状态的服务；已手动停止的服务不会被自动启动。"
+}
+cmd_watchdog_disable() {
+  need_init
+  if [[ "$INIT_SYS" == systemd ]]; then
+    local path changed=0
+    for path in "$WATCHDOG_SYSTEMD_TIMER" "$WATCHDOG_SYSTEMD_SERVICE" "$WATCHDOG_SINGBOX_DROPIN"; do watchdog_path_safe "$path" || return 1; done
+    if [[ -e "$WATCHDOG_XRAY_DROPIN" ]]; then watchdog_path_safe "$WATCHDOG_XRAY_DROPIN" || return 1; fi
+    if watchdog_file_owned "$WATCHDOG_SYSTEMD_TIMER"; then systemctl disable --now "$WATCHDOG_TIMER" >/dev/null 2>&1 || true; fi
+    for path in "$WATCHDOG_SYSTEMD_TIMER" "$WATCHDOG_SYSTEMD_SERVICE" "$WATCHDOG_SINGBOX_DROPIN" "$WATCHDOG_XRAY_DROPIN"; do
+      if watchdog_file_owned "$path"; then rm -f -- "$path"; changed=1; fi
+    done
+    rmdir "${WATCHDOG_SINGBOX_DROPIN%/*}" "${WATCHDOG_XRAY_DROPIN%/*}" 2>/dev/null || true
+    if (( changed )); then systemctl daemon-reload; fi
+    echo "看门狗已停用；现有 sing-box/Xray 节点服务不会被停止或重启。"
+  else
+    local restart_singbox=0 answer
+    watchdog_path_safe "$WATCHDOG_OPENRC_INIT" || return 1
+    watchdog_openrc_block_check || return 1
+    if openrc_is_official "$OPENRC_INIT" && watchdog_openrc_block_present && svc_is_running; then
+      restart_singbox=1
+      read -r -p "停用将恢复 Alpine 官方 sing-box 原重生上限；需重启一次以应用，现有连接会短暂中断。继续？[y/N]: " answer || answer=""
+      [[ "${answer,,}" =~ ^(y|yes)$ ]] || { echo "已取消，未修改看门狗配置。"; return 0; }
+    fi
+    if watchdog_file_owned "$WATCHDOG_OPENRC_INIT"; then
+      rc-update del "$WATCHDOG_SERVICE" default >/dev/null 2>&1 || true
+      rc-service "$WATCHDOG_SERVICE" stop >/dev/null 2>&1 || true
+      rm -f -- "$WATCHDOG_OPENRC_INIT"
+    fi
+    watchdog_remove_openrc_override || die "无法安全移除 OpenRC 看门狗 respawn 配置"
+    if (( restart_singbox )); then rc-service "$SERVICE" restart || die "看门狗配置已移除，但 sing-box 重启失败"; fi
+    echo "OpenRC 看门狗已停用；节点服务未被停止。日志保留在 $WATCHDOG_LOG。"
+  fi
+}
+watchdog_menu() {
+  local choice
+  while true; do
+    echo
+    echo "========== 节点服务看门狗 =========="
+    echo "1) 启用/安装"
+    echo "2) 查看状态"
+    echo "3) 立即检查并尝试恢复监听异常"
+    echo "4) 停用"
+    echo "0) 返回"
+    read -r -p "选择 [0-4]: " choice || return 0
+    case "$choice" in
+      1) cmd_watchdog_enable ;;
+      2) cmd_watchdog_status ;;
+      3) cmd_watchdog_check ;;
+      4) cmd_watchdog_disable ;;
+      0) return 0 ;;
+      *) echo "无效选项" ;;
+    esac
+    pause
+  done
+}
 usage() {
   cat <<TXT
 singbox-manager ${SCRIPT_VERSION}
@@ -2319,7 +2875,10 @@ singbox-manager ${SCRIPT_VERSION}
   menu             打开管理菜单
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
   links            查看所有节点的参数和分享链接
-  add-all          新增全部 7 类节点并输出非 Telegram 链接的 Base64 导入内容
+  add-all          新增全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
+  bbr [status|reset] 自动选用内核支持的标准 TCP BBR；status 查看，reset 恢复
+  storage          统计管理脚本、节点数据、备份和日志的磁盘占用（只读）
+  watchdog [enable|status|check|disable]  管理 sing-box / Xray 节点服务看门狗
   host             修改服务器地址（自动识别公网 IP），并重新生成分享链接
   relay            中转 / 端口转发菜单
   relay add        添加中转（本机入口 → 落地节点）
@@ -2365,9 +2924,12 @@ menu() {
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
     echo "20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）"
-    echo "21) 批量添加全部 7 类节点并输出 Base64 汇总（不含 Telegram）"
+    echo "21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64"
+    echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
+    echo "23) 查看管理脚本/节点数据/备份/日志占用"
+    echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
     echo "0) 退出"
-    read -r -p "选择 [0-21]: " choice || exit 0
+    read -r -p "选择 [0-24]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -2390,6 +2952,9 @@ menu() {
       19) cmd_port ;;
       20) xray_add_node ;;
       21) add_all_protocols ;;
+      22) cmd_bbr_apply ;;
+      23) cmd_storage ;;
+      24) watchdog_menu ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -2461,6 +3026,9 @@ main() {
     port) prepare_manage; cmd_port "${2:-}" "${3:-}" ;;
     links) need_jq; show_links ;;
     add-all) prepare_manage; add_all_protocols ;;
+    bbr) case "${2:-apply}" in apply|auto) cmd_bbr_apply ;; status|show) cmd_bbr_status ;; reset|off|remove) cmd_bbr_reset ;; *) usage; exit 2 ;; esac ;;
+    storage|disk) cmd_storage ;;
+    watchdog) case "${2:-menu}" in menu) watchdog_menu ;; enable|on) cmd_watchdog_enable ;; status|show) cmd_watchdog_status ;; check|run) cmd_watchdog_check "${3:-}" ;; disable|off|remove) cmd_watchdog_disable ;; loop) cmd_watchdog_loop ;; *) usage; exit 2 ;; esac ;;
     host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
     status) status ;;
