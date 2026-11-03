@@ -2,14 +2,14 @@
 
 ## 安装包内容
 
-压缩包包含更新后的 `singbox-manager.sh`、项目 `README.md`、本说明和 SHA-256 校验清单。安装包不含任何服务器配置、数据库、节点凭据、证书或私钥；Xray 内核在首次添加节点时按服务器 CPU 架构从官方发布页下载，并核验官方 `.dgst` 中的 SHA-256。
+压缩包包含更新后的 `singbox-manager.sh`、项目 `README.md`、本说明和 SHA-256 校验清单。安装包不含任何服务器配置、数据库、节点凭据、证书或私钥；Xray 内核在首次添加节点时按服务器 CPU 架构从官方发布页下载，并核验官方 `.dgst` 中的 SHA-256。脚本会先检测 `unzip`：Debian/Ubuntu 使用 `apt-get` 安装，Alpine 使用 `apk` 安装；若包索引过期，会刷新索引后重试。
 
 ## 安装或更新管理脚本
 
 支持 Debian / Ubuntu 系和 Alpine Linux（OpenRC）。先把安装包传到服务器，再执行：
 
 ```bash
-unzip singbox-manager-xray-xhttp-2026.11.03.2.zip -d singbox-xray-package
+unzip singbox-manager-xray-xhttp-2026.11.03.3.zip -d singbox-xray-package
 cd singbox-xray-package
 sha256sum -c SHA256SUMS.txt
 chmod +x singbox-manager.sh

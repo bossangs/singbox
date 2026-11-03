@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.03.2"
+SCRIPT_VERSION="2026.11.03.3"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -927,6 +927,24 @@ xray_arch() {
     *) return 1 ;;
   esac
 }
+xray_ensure_unzip() {
+  have unzip && return 0
+  echo "未检测到 unzip，正在按系统安装解压工具……"
+  if have apk && ! have apt-get; then
+    if ! apk add --no-cache unzip; then
+      apk update && apk add --no-cache unzip || die "Alpine 安装 unzip 失败；请检查 apk 源和网络后重试"
+    fi
+  elif have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get install -y unzip; then
+      apt-get update && apt-get install -y unzip || die "Debian/Ubuntu 安装 unzip 失败；请检查 apt 源和网络后重试"
+    fi
+  else
+    die "未找到 apk 或 apt-get，无法自动安装 unzip"
+  fi
+  have unzip || die "安装命令已结束，但仍未找到 unzip"
+  echo "unzip 已就绪。"
+}
 xray_install_core() {
   local latest version arch base tmp expected actual candidate
   if [[ -e "$XRAY_BIN" || -L "$XRAY_BIN" ]]; then
@@ -935,6 +953,7 @@ xray_install_core() {
     return 0
   fi
   arch="$(xray_arch)" || die "Xray 官方发行包暂不支持此 CPU 架构：$(uname -m)"
+  xray_ensure_unzip
   echo "正在从 Xray 官方 GitHub Releases 安装 Xray 内核（架构：$arch）……"
   latest="$(curl -fsSLI --max-time 30 -o /dev/null -w '%{url_effective}' https://github.com/XTLS/Xray-core/releases/latest)" || die "读取 Xray 官方最新版本失败"
   version="${latest##*/}"
