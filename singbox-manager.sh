@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.03.3"
+SCRIPT_VERSION="2026.11.03.4"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1272,6 +1272,7 @@ xray_add_node() {
   if ! xray_commit_jq "$port" --argjson obj "$obj" '.inbounds += [$obj]'; then
     rm -f "$XRAY_DATA/$tag.json" "$cert" "$key"; return 1
   fi
+  LAST_TAG="$tag"
   echo "Xray VLESS + TLS 节点已添加：$tag（$uri_type；Xray $("$XRAY_BIN" version | awk 'NR==1{print $2}')）"
   echo "证书采用自签 + SHA-256 pin；客户端需支持分享链接参数 pcs，不能支持时请使用受信任证书或客户端的证书指纹设置。"
   print_link "$XRAY_DATA/$tag.json"
@@ -1447,6 +1448,25 @@ print_link() {
       ;;
     *) echo "（未知协议 $proto，无法生成分享链接）" ;;
   esac
+}
+print_import_payload() {
+  # 将传入节点的 URI 按行合并后 Base64 编码；仅输出客户端协议链接，自动排除 Telegram 深链。
+  local f tmp encoded
+  tmp="$(mktemp)"
+  for f in "$@"; do
+    print_link "$f" | grep -E '^(vless|hysteria2|hy2|tuic|anytls|ss)://' >>"$tmp" || true
+  done
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "没有可合并的非 Telegram 分享链接。"
+    return 0
+  fi
+  encoded="$(base64 <"$tmp" | tr -d '\r\n')"
+  rm -f "$tmp"
+  echo
+  echo "以下是新建非 Telegram 节点的 Base64 导入内容（每条分享链接按一行编码，复制整行）："
+  echo "这是文本内容，不是公网订阅 URL；脚本没有创建或部署订阅地址。"
+  printf '%s\n' "$encoded"
 }
 save_node() {
   # $1：节点 tag；$2：凭据 JSON。保存后显示参数和分享链接
@@ -1646,6 +1666,39 @@ add_telegram_socks() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg username "$username" --arg password "$password" \
     '{protocol:"Telegram SOCKS5",tag:$tag,server:$host,port:$port,username:$username,password:$password}')"
+}
+add_all_protocols() {
+  local confirm
+  local created_files=()
+  cat <<'TXT'
+这会依次新增 7 类节点：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、Xray VLESS + TLS（默认 XHTTP auto）。
+每类节点都会沿用原有添加流程，逐项询问名称、端口或 TLS 参数并立即保存配置、显示分享链接；首次创建 Xray 节点时会安装独立 Xray sidecar。
+各节点分别提交；若中途失败，之前成功创建的节点会保留，尚未执行的类型不会创建。端口仍需自行在防火墙和云安全组放行。
+TXT
+  read -r -p "确认开始批量新增全部协议节点？输入 y 继续 [y/N]: " confirm || confirm=""
+  case "${confirm,,}" in y|yes) ;; *) echo "已取消，没有新增节点。"; return 0 ;; esac
+  echo "[1/7] VLESS + Reality"
+  add_reality
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[2/7] Hysteria2"
+  add_hy2
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[3/7] TUIC"
+  add_tuic
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[4/7] AnyTLS"
+  add_anytls
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[5/7] Shadowsocks"
+  add_ss
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[6/7] Telegram SOCKS5"
+  add_telegram_socks
+  echo "[7/7] Xray VLESS + TLS"
+  xray_add_node
+  created_files+=("$XRAY_DATA/$LAST_TAG.json")
+  echo "全部 7 类节点均已创建，以上已逐项显示分享链接。"
+  print_import_payload "${created_files[@]}"
 }
 
 # ---------- 中转：解析落地节点分享链接 ----------
@@ -2266,6 +2319,7 @@ singbox-manager ${SCRIPT_VERSION}
   menu             打开管理菜单
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
   links            查看所有节点的参数和分享链接
+  add-all          新增全部 7 类节点并输出非 Telegram 链接的 Base64 导入内容
   host             修改服务器地址（自动识别公网 IP），并重新生成分享链接
   relay            中转 / 端口转发菜单
   relay add        添加中转（本机入口 → 落地节点）
@@ -2311,8 +2365,9 @@ menu() {
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
     echo "20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）"
+    echo "21) 批量添加全部 7 类节点并输出 Base64 汇总（不含 Telegram）"
     echo "0) 退出"
-    read -r -p "选择 [0-20]: " choice || exit 0
+    read -r -p "选择 [0-21]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -2334,6 +2389,7 @@ menu() {
       18) cmd_fp ;;
       19) cmd_port ;;
       20) xray_add_node ;;
+      21) add_all_protocols ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -2404,6 +2460,7 @@ main() {
     fp|fingerprint) need_jq; cmd_fp "${2:-}" "${*:3}" ;;
     port) prepare_manage; cmd_port "${2:-}" "${3:-}" ;;
     links) need_jq; show_links ;;
+    add-all) prepare_manage; add_all_protocols ;;
     host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
     status) status ;;

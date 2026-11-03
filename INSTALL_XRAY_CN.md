@@ -9,7 +9,7 @@
 支持 Debian / Ubuntu 系和 Alpine Linux（OpenRC）。先把安装包传到服务器，再执行：
 
 ```bash
-unzip singbox-manager-xray-xhttp-2026.11.03.3.zip -d singbox-xray-package
+unzip singbox-manager-xray-xhttp-2026.11.03.4.zip -d singbox-xray-package
 cd singbox-xray-package
 sha256sum -c SHA256SUMS.txt
 chmod +x singbox-manager.sh
@@ -30,6 +30,8 @@ sudo sb xray add
 
 节点建好后，脚本会打印 VLESS 链接。请在系统防火墙和 VPS 云安全组放行屏幕显示的 **TCP 端口**；脚本不会自动改防火墙。传输协议、TLS 域名、XHTTP path 或 Host 改动后，客户端也必须使用相同参数。
 
+若要一次添加脚本支持的全部协议节点，可在管理菜单选择 **21**，或运行 `sudo sb add-all`。脚本会逐项执行各协议的原有交互流程，依次添加 VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5 和 Xray VLESS + TLS（默认 XHTTP auto），并在每项创建成功后显示分享链接。此操作会先要求输入 `y` 确认；节点分别提交，若中途失败，已成功创建的节点会保留，后续步骤停止。全部成功后，脚本会把本次新建的非 Telegram 链接按行合并、Base64 编码并打印成一条可复制内容；Telegram 的 `tg://` 与 `https://t.me` 链接排除。它不是公网 URL，不会创建订阅服务。防火墙端口仍需手动放行。
+
 Alpine/OpenRC 上 Xray 以专用非 root 用户运行，因此端口需选择 1024 或以上；默认端口符合要求。Debian/Ubuntu 的 systemd 服务配置了绑定低端口所需能力。
 
 ## 自签证书如何验证
@@ -42,6 +44,7 @@ Alpine/OpenRC 上 Xray 以专用非 root 用户运行，因此端口需选择 10
 
 ```bash
 sudo sb links                  # 查看所有 sing-box 与 Xray 节点及分享链接
+sudo sb add-all                # 新增全部 7 类节点，最后输出非 Telegram 链接的 Base64 内容
 sudo sb port 节点名称 新端口     # 修改 Xray 或 sing-box 节点端口
 sudo sb xray status            # 查看 Xray 版本、服务及监听端口
 sudo sb xray check             # 校验 Xray 配置
@@ -60,6 +63,6 @@ Xray sidecar 使用专用二进制 `/usr/local/bin/singbox-xray`、服务 `singb
 
 Xray 节点和原有 sing-box 节点分别管理、分别备份，但都能通过 `sb links` 查看，也可用 `sb port` 和菜单删除。防火墙放行仍需手动完成。
 
-## 本地版本更新说明
+## 版本更新说明
 
-本包中的 Xray 改动仅在本地交付，没有推送到公开仓库。`sb update` 检测到远端脚本版本低于当前本地版本时会拒绝降级；保留 Xray 功能请继续从对应安装包更新，等公开版本包含该功能后再使用在线更新。
+`sb update` 检测到远端脚本版本低于当前本地版本时会拒绝降级，以免丢失功能。公开版本包含所需功能后，可以使用在线更新；否则请从对应安装包更新。

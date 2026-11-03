@@ -85,6 +85,8 @@ Telegram: https://t.me/o2oyww
 17) 中转 / 端口转发
 18) 修改节点 TLS 指纹（多指纹分享链接）
 19) 修改节点端口
+20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）
+21) 批量添加全部 7 类节点并输出 Base64 汇总（不含 Telegram）
 0) 退出
 ```
 
@@ -97,6 +99,14 @@ Telegram: https://t.me/o2oyww
 - Telegram SOCKS5 会生成随机用户名和密码，并输出 Telegram 官方 `https://t.me/socks?...` 与 `tg://socks?...` 一键添加链接，同时保留手动参数。
 - 脚本先备份当前配置，再写入新节点并用 `sing-box check` 校验。校验失败会自动恢复最近一次备份；通过则重启服务。
 - 屏幕上会显示节点参数、分享链接或手动配置字段，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 8 或 `sb links` 再看。
+
+### 批量添加全部协议节点
+
+管理菜单选 **21**，或运行 `sb add-all`，可以按顺序新增本脚本支持的全部 7 类节点：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5，以及 Xray VLESS + TLS（默认 XHTTP auto）。开始前会要求输入 `y` 确认；随后沿用各协议原有的添加流程，逐项询问需要的名称、端口、TLS 域名或传输参数，并在每个节点创建成功后立即显示它的分享链接。第一次创建 Xray 节点时会额外安装独立的 Xray sidecar。
+
+七类节点全部创建成功后，脚本还会把本次新建的非 Telegram 节点分享链接（VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Xray VLESS + TLS；多指纹会分别包含）按行合并并 Base64 编码，最后输出一条可复制的导入内容。Telegram SOCKS5 的 `tg://` 和 `https://t.me` 链接不放进这条内容。它只是终端里显示的一段文本，不是公网 URL，也不会部署订阅服务。
+
+每类节点分别保存和校验，不是一个整体事务：如果某一步失败，先前成功创建的节点会保留，后面的协议不会继续添加。脚本不会自动开放端口；请按每个节点显示的协议和端口，在系统防火墙及云安全组中放行。
 
 ### Telegram 内置代理（SOCKS5）
 
@@ -284,6 +294,7 @@ sb relay del
 | --- | --- |
 | `sb` | 打开管理菜单 |
 | `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
+| `sb add-all` | 逐项新增全部 7 类协议节点，最后输出非 Telegram 链接的 Base64 导入内容 |
 | `sb links` | 查看所有节点的参数和分享链接 |
 | `sb host` | 修改服务器地址并重新生成分享链接 |
 | `sb relay` | 中转 / 端口转发菜单 |
@@ -325,11 +336,11 @@ Xray 节点使用独立 TCP 端口，脚本不会自动改防火墙。创建节�
 sb update
 ```
 
-如果本地脚本版本比远端公开版本新，更新命令会拒绝降级，以免丢失尚未公开的本地功能；本地 Xray 构建请使用对应安装包更新。
+如果本地脚本版本比远端公开版本新，更新命令会拒绝降级，以免丢失本地功能；公开版本包含所需功能后，可用 `sb update` 更新，否则使用对应安装包。
 
 ## 从旧版本升级（已经装过本脚本的服务器）
 
-旧版本没有 `sb`，而且如果当时在 IP 提示处直接回车，分享链接里会是 `YOUR_SERVER_IP`。使用本地安装包中的脚本重新运行 `install`，会创建 `sb`、清理官方示例节点并保留你已有的节点（服务会重启一下）。要安装含 Xray 功能的当前本地版本，请按 [Xray/XHTTP 安装说明](INSTALL_XRAY_CN.md) 使用安装包；不要从尚未更新的公开分支下载脚本。
+旧版本没有 `sb`，而且如果当时在 IP 提示处直接回车，分享链接里会是 `YOUR_SERVER_IP`。使用本地安装包中的脚本重新运行 `install`，会创建 `sb`、清理官方示例节点并保留你已有的节点（服务会重启一下）。也可以按 [Xray/XHTTP 安装说明](INSTALL_XRAY_CN.md) 使用完整安装包更新。
 
 ```bash
 chmod +x singbox-manager.sh
