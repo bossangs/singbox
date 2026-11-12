@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.03.7"
+SCRIPT_VERSION="2026.11.12.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -33,6 +33,14 @@ DATA="$CONF_DIR/manager"
 CERT_DIR="$CONF_DIR/certs"
 BACKUP_DIR="/var/backups/sing-box-manager"
 SERVICE="sing-box"
+TRAFFIC_MARK="# @bossangs-singbox-manager-traffic"
+TRAFFIC_SERVICE="singbox-manager-traffic"
+TRAFFIC_TOTAL="$DATA/traffic-total.json"
+TRAFFIC_MARKER="$DATA/.traffic-enabled-by-singbox-manager"
+TRAFFIC_LOCK="$DATA/.traffic-monitor.lock"
+TRAFFIC_UNIT="/etc/systemd/system/${TRAFFIC_SERVICE}.service"
+TRAFFIC_INIT="/etc/init.d/${TRAFFIC_SERVICE}"
+TRAFFIC_LOG="/var/log/${TRAFFIC_SERVICE}.log"
 # sing-box 官方 deb/rpm 包自带示例配置里的 Shadowsocks 密码（公开的，不能留在线上）
 OFFICIAL_SAMPLE_PW="Gn1JUS14bLUHgv1cWDDp4A=="
 SB=""
@@ -2248,6 +2256,311 @@ cmd_port() {
 }
 
 # ---------- 管理 ----------
+traffic_configured() {
+  jq -e '.experimental.clash_api | (.external_controller | type == "string") and (.secret | type == "string" and length > 0)' \
+    "$CONF" >/dev/null 2>&1
+}
+traffic_fingerprint() {
+  jq -c '[.experimental.clash_api.external_controller, .experimental.clash_api.secret]' "$CONF" |
+    openssl dgst -sha256 | awk '{print $NF}'
+}
+traffic_config_owned() {
+  local controller fingerprint
+  [[ -f "$TRAFFIC_MARKER" && ! -L "$TRAFFIC_MARKER" ]] || return 1
+  [[ "$(sed -n '1p' "$TRAFFIC_MARKER")" == "$TRAFFIC_MARK" ]] || return 1
+  traffic_configured || return 1
+  controller="$(jq -r '.experimental.clash_api.external_controller' "$CONF")"
+  fingerprint="$(traffic_fingerprint)"
+  [[ "$(sed -n '2p' "$TRAFFIC_MARKER")" == "$controller" &&
+    "$(sed -n '3p' "$TRAFFIC_MARKER")" == "$fingerprint" ]]
+}
+traffic_script_path() {
+  local path
+  path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  [[ -f "$path" && "$path" != /dev/fd/* && "$path" != /proc/* ]] || die "流量统计服务需要从一个已保存的脚本文件启动"
+  [[ ! "$path" =~ [[:space:]\"\\] ]] || die "脚本路径含空格或特殊字符，不能安全写入服务配置：$path"
+  printf '%s' "$path"
+}
+traffic_path_owned_or_absent() {
+  local path="$1"
+  [[ ! -L "$path" ]] || die "统计服务目标是符号链接，为保护现有文件未操作：$path"
+  if [[ -e "$path" ]] && ! grep -qxF -- "$TRAFFIC_MARK" "$path" 2>/dev/null; then
+    die "统计服务目标已存在且不属于本脚本，为保护现有文件未覆盖：$path"
+  fi
+}
+traffic_write_service_file() {
+  local path="$1" content="$2" dir tmp
+  dir="${path%/*}"
+  traffic_path_owned_or_absent "$path"
+  [[ ! -L "$dir" ]] || die "统计服务目录是符号链接，为保护现有文件未操作：$dir"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/.${TRAFFIC_SERVICE}.XXXXXX")"
+  if ! printf '%s\n' "$content" >"$tmp" || ! chmod 644 "$tmp" || ! mv -f -- "$tmp" "$path"; then
+    rm -f -- "$tmp"
+    die "无法写入流量统计服务文件：$path"
+  fi
+}
+traffic_systemd_text() {
+  local path
+  path="$(traffic_script_path)"
+  cat <<UNIT
+$TRAFFIC_MARK
+[Unit]
+Description=sing-box traffic statistics collector
+After=network-online.target sing-box.service
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/bin/bash $path traffic-monitor
+Restart=always
+RestartSec=2
+User=root
+NoNewPrivileges=true
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+traffic_openrc_text() {
+  local path
+  path="$(traffic_script_path)"
+  cat <<RC
+#!/sbin/openrc-run
+$TRAFFIC_MARK
+name="$TRAFFIC_SERVICE"
+description="sing-box traffic statistics collector"
+supervisor="supervise-daemon"
+command="/bin/bash"
+command_args="$path traffic-monitor"
+output_log="$TRAFFIC_LOG"
+error_log="$TRAFFIC_LOG"
+respawn_delay=2
+respawn_max=0
+depend() {
+  need sing-box
+  after net
+}
+RC
+}
+traffic_preflight_service() {
+  need_init
+  if [[ "$INIT_SYS" == systemd ]]; then traffic_path_owned_or_absent "$TRAFFIC_UNIT"
+  else traffic_path_owned_or_absent "$TRAFFIC_INIT"; fi
+}
+traffic_install_service() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    traffic_write_service_file "$TRAFFIC_UNIT" "$(traffic_systemd_text)"
+    systemctl daemon-reload
+  elif is_openrc; then
+    traffic_write_service_file "$TRAFFIC_INIT" "$(traffic_openrc_text)"
+    chmod 755 "$TRAFFIC_INIT"
+    touch "$TRAFFIC_LOG"
+    chmod 600 "$TRAFFIC_LOG"
+  else
+    die "没有找到 systemd 或 OpenRC，无法安装流量统计监控服务"
+  fi
+}
+traffic_start_service() {
+  traffic_install_service
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl enable --now "$TRAFFIC_SERVICE"
+  else
+    rc-update add "$TRAFFIC_SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$TRAFFIC_SERVICE" start || rc-service "$TRAFFIC_SERVICE" restart
+  fi
+}
+traffic_stop_service() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    [[ "$(systemctl is-active "$TRAFFIC_SERVICE" 2>/dev/null || true)" != active ]] || systemctl stop "$TRAFFIC_SERVICE"
+  elif rc-service "$TRAFFIC_SERVICE" status >/dev/null 2>&1; then
+    rc-service "$TRAFFIC_SERVICE" stop
+  fi
+}
+traffic_init_total() {
+  local now tmp
+  [[ ! -L "$TRAFFIC_TOTAL" ]] || die "统计数据文件是符号链接，为保护数据未操作：$TRAFFIC_TOTAL"
+  if [[ -f "$TRAFFIC_TOTAL" ]]; then
+    jq -e 'type == "object" and (.up | type == "number" and . >= 0) and (.down | type == "number" and . >= 0)' \
+      "$TRAFFIC_TOTAL" >/dev/null 2>&1 || die "累计流量数据文件无效，未重置：$TRAFFIC_TOTAL"
+    return 0
+  fi
+  now="$(date -Iseconds)"
+  tmp="$(mktemp "$DATA/.traffic-total.XXXXXX")"
+  jq -n --arg now "$now" '{started_at:$now,updated_at:$now,up:0,down:0}' >"$tmp"
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$TRAFFIC_TOTAL"
+}
+traffic_add_delta() {
+  local line="$1" up down now tmp
+  jq -e 'type == "object" and (.up | type == "number" and . >= 0) and (.down | type == "number" and . >= 0)' \
+    <<<"$line" >/dev/null 2>&1 || return 0
+  up="$(jq -r '.up | floor' <<<"$line")"
+  down="$(jq -r '.down | floor' <<<"$line")"
+  now="$(date -Iseconds)"
+  tmp="$(mktemp "$DATA/.traffic-total.XXXXXX")"
+  if ! jq --argjson up "$up" --argjson down "$down" --arg now "$now" \
+      '{started_at:(.started_at // $now),updated_at:$now,up:((.up // 0)+$up),down:((.down // 0)+$down)}' \
+      "$TRAFFIC_TOTAL" >"$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv -f -- "$tmp" "$TRAFFIC_TOTAL"
+}
+traffic_lock_release() {
+  local pid
+  pid="$(cat "$TRAFFIC_LOCK/pid" 2>/dev/null || true)"
+  if [[ "$pid" == "$$" ]]; then
+    rm -f -- "$TRAFFIC_LOCK/pid"
+    rmdir -- "$TRAFFIC_LOCK" 2>/dev/null || true
+  fi
+}
+traffic_lock_acquire() {
+  local attempt pid inode current_inode
+  mkdir -p "$DATA"
+  for attempt in 1 2 3; do
+    if mkdir -- "$TRAFFIC_LOCK" 2>/dev/null; then
+      printf '%s\n' "$$" >"$TRAFFIC_LOCK/pid"
+      trap 'traffic_lock_release' EXIT
+      trap 'exit 0' INT TERM
+      return 0
+    fi
+    [[ -d "$TRAFFIC_LOCK" && ! -L "$TRAFFIC_LOCK" ]] || die "流量监控锁路径异常：$TRAFFIC_LOCK"
+    inode="$(stat -c '%i' "$TRAFFIC_LOCK" 2>/dev/null || true)"
+    pid="$(cat "$TRAFFIC_LOCK/pid" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      die "流量统计采集器已经运行（PID $pid）"
+    fi
+    sleep 1
+    current_inode="$(stat -c '%i' "$TRAFFIC_LOCK" 2>/dev/null || true)"
+    [[ -n "$inode" && "$inode" == "$current_inode" ]] || continue
+    pid="$(cat "$TRAFFIC_LOCK/pid" 2>/dev/null || true)"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+      rm -f -- "$TRAFFIC_LOCK/pid"
+      rmdir -- "$TRAFFIC_LOCK" 2>/dev/null || true
+    fi
+  done
+  die "无法取得流量统计采集锁：$TRAFFIC_LOCK"
+}
+traffic_monitor() {
+  local controller port secret auth_file
+  traffic_config_owned || die "统计监控停止：当前 Clash API 配置与管理器记录不匹配"
+  controller="$(jq -r '.experimental.clash_api.external_controller' "$CONF")"
+  [[ "$controller" =~ ^127\.0\.0\.1:([0-9]{1,5})$ ]] || die "统计监控只允许连接本机回环地址"
+  port="${BASH_REMATCH[1]}"
+  secret="$(jq -r '.experimental.clash_api.secret' "$CONF")"
+  [[ "$secret" =~ ^[A-Fa-f0-9]{64}$ ]] || die "统计 API 密钥格式无效"
+  traffic_lock_acquire
+  traffic_init_total
+  auth_file="$DATA/.traffic-curl.conf"
+  printf 'header = "Authorization: Bearer %s"\n' "$secret" >"$auth_file"
+  chmod 600 "$auth_file"
+  while true; do
+    if curl -fsS --no-buffer --connect-timeout 5 --config "$auth_file" \
+        "http://127.0.0.1:${port}/traffic" 2>/dev/null |
+        while IFS= read -r line; do traffic_add_delta "$line"; done; then
+      :
+    fi
+    sleep 2
+  done
+}
+traffic_find_port() {
+  local p
+  for ((p=19090; p<=19190; p++)); do
+    port_in_config "$p" && continue
+    if [[ -f "$XRAY_CONF" ]] && xray_port_in_config "$p"; then continue; fi
+    port_free "$p" tcp && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+traffic_enable() {
+  local port controller secret marker_tmp backup had_total=0
+  need_jq
+  need_sb
+  if traffic_config_owned; then
+    traffic_init_total
+    traffic_start_service
+    return 0
+  fi
+  if jq -e '.experimental.clash_api? != null' "$CONF" >/dev/null 2>&1; then
+    die "配置中已有 Clash API，未覆盖现有设置；请先自行确认并移除后再启用管理器统计"
+  fi
+  if jq -e '(.experimental.v2ray_api.listen? // "") != ""' "$CONF" >/dev/null 2>&1; then
+    die "当前配置启用了 V2Ray API；为避免统计计数器冲突，未启用 Clash API 流量统计"
+  fi
+  port="$(traffic_find_port)" || die "没有找到可用的本机统计端口（19090-19190）"
+  controller="127.0.0.1:$port"
+  secret="$(openssl rand -hex 32)"
+  traffic_preflight_service
+  [[ ! -f "$TRAFFIC_TOTAL" ]] || had_total=1
+  traffic_init_total
+  # Clash API 只绑定回环地址并使用随机密钥，不会在公网开放管理接口。
+  commit_jq --arg controller "$controller" --arg secret "$secret" \
+    '.experimental = (.experimental // {}) | .experimental.clash_api = {external_controller:$controller,secret:$secret}'
+  backup="$LAST_BACKUP"
+  marker_tmp="$(mktemp "$DATA/.traffic-enabled.XXXXXX")"
+  printf '%s\n%s\n%s\n' "$TRAFFIC_MARK" "$controller" "$(traffic_fingerprint)" >"$marker_tmp"
+  chmod 600 "$marker_tmp"
+  mv -f -- "$marker_tmp" "$TRAFFIC_MARKER"
+  if ! traffic_start_service; then
+    traffic_remove_service || true
+    rm -f -- "$TRAFFIC_MARKER"
+    (( had_total )) || rm -f -- "$TRAFFIC_TOTAL"
+    if [[ -n "$backup" && -f "$backup" ]]; then
+      cp -a "$backup" "$CONF"
+      if check_config && reload_service && svc_healthy; then
+        die "流量采集服务启动失败；已恢复 sing-box 原配置并保留节点，请检查 systemd/OpenRC 服务状态"
+      fi
+      die "流量采集服务启动失败；已写回原配置，但 sing-box 服务未能恢复，请检查日志：$(svc_log_hint)"
+    fi
+    die "流量采集服务启动失败；没有找到可用备份，需检查配置：$CONF"
+  fi
+  echo "已启用 sing-box 入/出流量累计统计；API 仅监听 127.0.0.1:$port，统计从现在开始。"
+}
+traffic_format_bytes() {
+  awk -v bytes="$1" 'BEGIN { split("B KiB MiB GiB TiB PiB", u, " "); i=1; while (bytes >= 1024 && i < 6) { bytes /= 1024; i++ } if (i == 1) printf "%.0f %s", bytes, u[i]; else printf "%.2f %s", bytes, u[i] }'
+}
+traffic_show() {
+  local started updated up down active
+  traffic_enable
+  started="$(jq -r '.started_at // "未知"' "$TRAFFIC_TOTAL")"
+  updated="$(jq -r '.updated_at // "未知"' "$TRAFFIC_TOTAL")"
+  up="$(jq -r '.up' "$TRAFFIC_TOTAL")"
+  down="$(jq -r '.down' "$TRAFFIC_TOTAL")"
+  if [[ "$INIT_SYS" == systemd ]]; then active="$(systemctl is-active "$TRAFFIC_SERVICE" 2>/dev/null || true)"
+  else active="$(rc-service "$TRAFFIC_SERVICE" status >/dev/null 2>&1 && echo running || echo stopped)"; fi
+  echo "sing-box 累计流量（Xray sidecar 流量不计入）"
+  printf '  入站 / 客户端上传（up）：%s\n' "$(traffic_format_bytes "$up")"
+  printf '  出站 / 客户端下载（down）：%s\n' "$(traffic_format_bytes "$down")"
+  printf '  统计开始：%s\n  最近更新：%s\n  采集服务：%s\n' "$started" "$updated" "$active"
+}
+traffic_remove_service() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl disable --now "$TRAFFIC_SERVICE" >/dev/null 2>&1 || true
+    if [[ -f "$TRAFFIC_UNIT" ]] && grep -qxF -- "$TRAFFIC_MARK" "$TRAFFIC_UNIT"; then rm -f -- "$TRAFFIC_UNIT"; fi
+    systemctl daemon-reload
+  else
+    rc-service "$TRAFFIC_SERVICE" stop >/dev/null 2>&1 || true
+    rc-update del "$TRAFFIC_SERVICE" default >/dev/null 2>&1 || true
+    if [[ -f "$TRAFFIC_INIT" ]] && grep -qxF -- "$TRAFFIC_MARK" "$TRAFFIC_INIT"; then rm -f -- "$TRAFFIC_INIT"; fi
+  fi
+  rm -f -- "$DATA/.traffic-curl.conf"
+}
+traffic_disable() {
+  traffic_config_owned || die "当前流量统计配置不是管理器创建的，未修改任何设置"
+  traffic_stop_service || die "无法停止流量采集服务，未移除 API 配置或统计数据"
+  commit_jq 'del(.experimental.clash_api) | if (.experimental // null) == {} then del(.experimental) else . end'
+  traffic_remove_service
+  rm -f -- "$TRAFFIC_MARKER"
+  echo "已停止流量采集并移除管理器添加的 Clash API；累计记录保留在 $TRAFFIC_TOTAL。"
+}
+cmd_traffic() {
+  case "${1:-show}" in
+    show|status|enable|on) traffic_show ;;
+    disable|off) traffic_disable ;;
+    *) die "用法：$(self_cmd) traffic [show|disable]" ;;
+  esac
+}
+
 list_nodes() {
   echo "已配置的入站节点："
   jq -r '.inbounds[]? | [(.tag // "-"), .type, (.listen_port|tostring), (.listen // "0.0.0.0")] | @tsv' "$CONF" |
@@ -2878,6 +3191,7 @@ singbox-manager ${SCRIPT_VERSION}
   add-all          新增全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
   bbr [status|reset] 自动选用内核支持的标准 TCP BBR；status 查看，reset 恢复
   storage          统计管理脚本、节点数据、备份和日志的磁盘占用（只读）
+  traffic [show|disable] 查看/启停 sing-box 入站与出站累计流量
   watchdog [enable|status|check|disable]  管理 sing-box / Xray 节点服务看门狗
   host             修改服务器地址（自动识别公网 IP），并重新生成分享链接
   relay            中转 / 端口转发菜单
@@ -2903,7 +3217,7 @@ menu() {
   while true; do
     echo
     echo "========== sing-box 多协议管理 ${SCRIPT_VERSION} =========="
-    echo "Telegram: https://t.me/o2oyww"
+    echo "Telegram: https://t.me/tuiji_channel"
     echo "1) 添加 VLESS + Reality"
     echo "2) 添加 Hysteria2"
     echo "3) 添加 TUIC"
@@ -2928,8 +3242,9 @@ menu() {
     echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
     echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
+    echo "25) 查看 sing-box 入/出累计流量"
     echo "0) 退出"
-    read -r -p "选择 [0-24]: " choice || exit 0
+    read -r -p "选择 [0-25]: " choice || exit 0
     case "$choice" in
       1) add_reality ;;
       2) add_hy2 ;;
@@ -2955,6 +3270,7 @@ menu() {
       22) cmd_bbr_apply ;;
       23) cmd_storage ;;
       24) watchdog_menu ;;
+      25) cmd_traffic show ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -3029,6 +3345,8 @@ main() {
     bbr) case "${2:-apply}" in apply|auto) cmd_bbr_apply ;; status|show) cmd_bbr_status ;; reset|off|remove) cmd_bbr_reset ;; *) usage; exit 2 ;; esac ;;
     storage|disk) cmd_storage ;;
     watchdog) case "${2:-menu}" in menu) watchdog_menu ;; enable|on) cmd_watchdog_enable ;; status|show) cmd_watchdog_status ;; check|run) cmd_watchdog_check "${3:-}" ;; disable|off|remove) cmd_watchdog_disable ;; loop) cmd_watchdog_loop ;; *) usage; exit 2 ;; esac ;;
+    traffic) prepare_manage; cmd_traffic "${2:-show}" ;;
+    traffic-monitor) need_jq; traffic_monitor ;;
     host) need_jq; cmd_set_host; if compgen -G "$RELAY_DIR/*.json" >/dev/null; then relay_list; fi ;;
     check) need_jq; check_no_conflicts; need_sb; check_config ;;
     status) status ;;

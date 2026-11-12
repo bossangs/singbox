@@ -65,7 +65,7 @@ Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提
 
 ```
 ========== sing-box 多协议管理 ==========
-Telegram: https://t.me/o2oyww
+Telegram: https://t.me/tuiji_channel
 1) 添加 VLESS + Reality
 2) 添加 Hysteria2
 3) 添加 TUIC
@@ -90,8 +90,13 @@ Telegram: https://t.me/o2oyww
 22) 自动选择并启用服务器 TCP BBR（需要确认）
 23) 查看管理脚本/节点数据/备份/日志占用
 24) 节点服务保活/看门狗（启用/状态/检查/停用）
+25) 查看 sing-box 入/出累计流量
 0) 退出
 ```
+
+### sing-box 入站 / 出站累计流量
+
+管理菜单选 **25**，或运行 `sb traffic`。首次使用会启用 sing-box [Clash API](https://sing-box.sagernet.org/configuration/experimental/clash-api/) 的 `/traffic` 统计接口，并安装一个 systemd / OpenRC 后台采集服务；API 只绑定 `127.0.0.1`，使用随机密钥，不会对公网开放。脚本把每秒增量保存到 `/etc/sing-box/manager/traffic-total.json`，因此累计值在 sing-box 重启或服务器重启后仍保留。统计从首次启用时开始，无法补算此前的流量；采集服务/API 中断期间的流量也无法补算。“入站 / 客户端上传（up）”和“出站 / 客户端下载（down）”分别显示，Xray sidecar 的流量不计入。运行 `sb traffic disable` 可停止采集并移除本功能添加的 API 配置，历史累计文件会保留。
 
 ### 添加节点的流程
 
