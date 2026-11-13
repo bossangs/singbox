@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.12.1"
+SCRIPT_VERSION="2026.11.13.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -27,6 +27,7 @@ XRAY_INIT="/etc/init.d/singbox-xray"
 XRAY_LOG="/var/log/singbox-xray.log"
 RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
+SS_SHORTCUT="/usr/local/bin/sb5"
 CONF_DIR="/etc/sing-box"
 CONF="$CONF_DIR/config.json"
 DATA="$CONF_DIR/manager"
@@ -155,6 +156,22 @@ need_sb() { resolve_sb || die "未找到 sing-box 程序。先运行：$(self_cm
 is_our_script() { [[ -f "$1" ]] && grep -qxF "$MARK" "$1" 2>/dev/null; }
 shortcut_is_ours() { [[ -f "$SHORTCUT" && ! -L "$SHORTCUT" ]] && is_our_script "$SHORTCUT"; }
 shortcut_is_foreign() { [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] && ! shortcut_is_ours; }
+ss_shortcut_is_ours() {
+  [[ -L "$SS_SHORTCUT" ]] && shortcut_is_ours &&
+    [[ "$(readlink -f "$SS_SHORTCUT" 2>/dev/null || true)" == "$(readlink -f "$SHORTCUT" 2>/dev/null || true)" ]]
+}
+install_ss_shortcut() {
+  ss_shortcut_is_ours && return 0
+  if [[ -e "$SS_SHORTCUT" || -L "$SS_SHORTCUT" ]]; then
+    echo "提示：$SS_SHORTCUT 已被其他文件或命令占用，未覆盖；仍可使用菜单第 5 项或 sb add-ss。" >&2
+    return 0
+  fi
+  ln -s "$SHORTCUT" "$SS_SHORTCUT" 2>/dev/null || {
+    echo "提示：未能创建 $SS_SHORTCUT；仍可使用菜单第 5 项或 sb add-ss。" >&2
+    return 0
+  }
+  echo "已创建 Shadowsocks 快捷命令：sb5（$SS_SHORTCUT）。"
+}
 fetch_latest() {
   # 下载最新脚本到 $1，并做语法和身份检查
   local dest="$1"
@@ -181,7 +198,8 @@ install_shortcut() {
     install -m 755 "$tmp" "$SHORTCUT"
     rm -f "$tmp"
   fi
-  echo "已创建快捷命令：sb（$SHORTCUT）。以后直接输入 sb 打开管理菜单。"
+  install_ss_shortcut
+  echo "已创建快捷命令：sb（$SHORTCUT）。以后输入 sb 打开管理菜单，或输入 sb5 直接添加 Shadowsocks。"
   if grep -qE '^[[:space:]]*alias[[:space:]]+sb=' /root/.bashrc 2>/dev/null; then
     echo "注意：/root/.bashrc 里有 alias sb=...，会覆盖 sb 快捷命令。请删除那一行后重新登录。" >&2
   fi
@@ -202,7 +220,8 @@ cmd_update() {
   fi
   install -m 755 "$tmp" "$SHORTCUT"
   rm -f "$tmp"
-  echo "已更新 sb：${SCRIPT_VERSION} -> ${new_ver:-未知}。运行 sb 打开管理菜单。"
+  install_ss_shortcut
+  echo "已更新 sb：${SCRIPT_VERSION} -> ${new_ver:-未知}。运行 sb 打开管理菜单；运行 sb5 直接添加 Shadowsocks。"
 }
 cmd_remove_shortcut() {
   if watchdog_file_owned "$WATCHDOG_SYSTEMD_TIMER" || watchdog_file_owned "$WATCHDOG_OPENRC_INIT"; then
@@ -210,6 +229,12 @@ cmd_remove_shortcut() {
     return 1
   fi
   if shortcut_is_ours; then
+    if ss_shortcut_is_ours; then
+      rm -f "$SS_SHORTCUT"
+      echo "已删除 Shadowsocks 快捷命令 sb5。"
+    elif [[ -e "$SS_SHORTCUT" || -L "$SS_SHORTCUT" ]]; then
+      echo "提示：$SS_SHORTCUT 不是本脚本创建的，保留不动。" >&2
+    fi
     rm -f "$SHORTCUT"
     echo "已删除 sb 快捷命令（sing-box 和节点不受影响）。"
   elif [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]]; then
@@ -3186,6 +3211,7 @@ singbox-manager ${SCRIPT_VERSION}
   （不带命令）     打开管理菜单
   install          安装依赖、sing-box、系统服务（systemd 或 OpenRC）和 sb 快捷命令
   menu             打开管理菜单
+  5|ss|add-ss      直接添加 Shadowsocks 节点（安装后也可运行 sb5）
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
   links            查看所有节点的参数和分享链接
   add-all          新增全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
@@ -3290,6 +3316,7 @@ prepare_manage() {
   [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] || install_shortcut
 }
 main() {
+  if [[ "${0##*/}" == sb5 && $# -eq 0 ]]; then set -- add-ss; fi
   case "${1:-menu}" in
     -h|--help|help) usage; exit 0 ;;
     version|-v|--version) echo "singbox-manager ${SCRIPT_VERSION}"; exit 0 ;;
@@ -3318,6 +3345,7 @@ main() {
       alias_notice
       ;;
     menu) prepare_manage; menu ;;
+    5|ss|shadowsocks|add-ss|sb5) prepare_manage; add_ss ;;
     relay)
       prepare_manage
       case "${2:-menu}" in

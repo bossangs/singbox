@@ -42,10 +42,10 @@ sb
 - 如果还没有 sing-box，安装最新版内核，最新版本号直接从 GitHub 发布页读取，不受 GitHub API 次数限制：
   - Debian / Ubuntu：用官方安装脚本 `https://sing-box.app/install.sh` 装官方 deb 包；没装成时改用官方发布的压缩包
   - Alpine：依次尝试官方发布的压缩包（musl 版，装到 `/usr/bin/sing-box`）→ 官方 apk 包 → Alpine 软件源里的 sing-box。官方 apk 包在 Alpine 3.21 等较老版本上会报 `IO ERROR`，所以优先用压缩包。每一步装完都会实际运行一次 sing-box 确认能用，才算成功
-  - 如果 `/usr/bin/sing-box` 已经存在（例如你自己从官方压缩包装好的），就直接使用它，只创建配置、服务和 `sb`
+  - 如果 `/usr/bin/sing-box` 已经存在（例如你自己从官方压缩包装好的），就直接使用它，只创建配置、服务和快捷命令
 - 生成初始配置 `/etc/sing-box/config.json`；如果官方安装包带了示例节点，会先备份再移除（见“注意事项”）
 - 校验配置，设置开机自启并启动 `sing-box` 服务（Debian 用 systemd，Alpine 用 OpenRC）
-- 创建快捷命令 `sb`（`/usr/local/bin/sb`）
+- 创建快捷命令 `sb`（`/usr/local/bin/sb`），并创建直接添加 Shadowsocks 的 `sb5`（`/usr/local/bin/sb5`）；若 `sb5` 已被其他文件或命令占用，不会覆盖
 
 ## 支持的协议
 
@@ -310,6 +310,7 @@ sb relay del
 | 命令 | 作用 |
 | --- | --- |
 | `sb` | 打开管理菜单 |
+| `sb5` | 直接添加 Shadowsocks 节点；也可运行 `sb 5`、`sb ss` 或 `sb add-ss` |
 | `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
 | `sb add-all` | 逐项新增全部 7 类节点，最后输出 v2rayNG 与 NekoBox/sing-box 两组 Base64 内容 |
 | `sb bbr` | 自动选择内核支持的标准 TCP BBR；确认后应用并持久化 |
@@ -336,8 +337,8 @@ sb relay del
 | `sb log` | 查看 sing-box 日志（默认最后 100 行，例如 `sb log 300`） |
 | `sb firewall` | 查看防火墙放行说明 |
 | `sb update` | 从本仓库下载最新版脚本并更新 `sb` |
-| `sb shortcut` | 创建或刷新 `sb` 快捷命令 |
-| `sb remove-shortcut` | 删除 `sb` 快捷命令（看门狗启用时需先停用） |
+| `sb shortcut` | 创建或刷新 `sb` 快捷命令及 `sb5`（不会覆盖已有的同名命令） |
+| `sb remove-shortcut` | 删除本脚本创建的 `sb` 和 `sb5` 快捷命令（看门狗启用时需先停用） |
 | `sb version` | 显示脚本版本 |
 | `sb help` | 显示帮助 |
 
