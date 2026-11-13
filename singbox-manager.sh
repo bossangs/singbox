@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.13.1"
+SCRIPT_VERSION="2026.11.13.2"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -3314,6 +3314,9 @@ prepare_manage() {
     (( LEFTOVER_SVC )) && echo "已写入本脚本的 sing-box 服务文件并重启服务。"
   fi
   [[ -e "$SHORTCUT" || -L "$SHORTCUT" ]] || install_shortcut
+  if shortcut_is_ours && [[ ! -e "$SS_SHORTCUT" && ! -L "$SS_SHORTCUT" ]]; then
+    install_ss_shortcut
+  fi
 }
 main() {
   if [[ "${0##*/}" == sb5 && $# -eq 0 ]]; then set -- add-ss; fi

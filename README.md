@@ -342,6 +342,8 @@ sb relay del
 | `sb version` | 显示脚本版本 |
 | `sb help` | 显示帮助 |
 
+从早于 `2026.11.13.2` 的旧版升级后，运行一次 `sb shortcut` 即可创建 `sb5` 快捷入口；新安装和之后的更新会自动创建或维护它。
+
 如果 `/usr/local/bin/sb` 已经被别的程序占用，脚本不会覆盖它，会提示你改用 `./singbox-manager.sh` 加上面的命令，例如 `./singbox-manager.sh links`。
 
 ## 服务器 TCP BBR
