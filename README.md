@@ -51,7 +51,7 @@ sb
 
 | 菜单 | 协议 | 传输 | 默认端口 | 说明 |
 | --- | --- | --- | --- | --- |
-| 1 | VLESS + Reality | TCP | 443 | flow 为 `xtls-rprx-vision`，默认握手域名 `www.cloudflare.com`，自动生成 Reality 密钥对和 short_id；可选多个 TLS 指纹 |
+| 1 | 本机 VLESS + Reality + Vision 入站 | TCP | 443 | 自动生成本机 UUID、Reality 密钥对和 short_id；可设置 SNI 并选择客户端 TLS 指纹，默认 SNI 为 `www.bing.com` |
 | 2 | Hysteria2 | UDP | 8443 | 使用自签证书 |
 | 3 | TUIC | UDP | 9443 | 拥塞控制 `bbr`，ALPN `h3`，使用自签证书 |
 | 4 | AnyTLS | TCP | 10443 | 使用自签证书；可选多个 TLS 指纹 |
@@ -66,7 +66,7 @@ Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提
 ```
 ========== sing-box 多协议管理 ==========
 Telegram: https://t.me/tuiji_channel
-1) 添加 VLESS + Reality
+1) 添加本机 VLESS + Reality + Vision 入站
 2) 添加 Hysteria2
 3) 添加 TUIC
 4) 添加 AnyTLS
@@ -93,6 +93,8 @@ Telegram: https://t.me/tuiji_channel
 25) 查看 sing-box 入/出累计流量
 0) 退出
 ```
+
+菜单 **1** 会在这台服务器创建实际的 VLESS + Reality + Vision 服务端入站：服务器地址自动识别或按需填写，UUID、Reality 密钥和 short ID 在本机生成，SNI 与客户端指纹可配置。示例链接里的 `packetEncoding=xudp` 是客户端 VLESS 出站设置，不是服务端入站字段；sing-box 客户端默认使用 xudp，因此本机入站不需要单独配置它。
 
 ### sing-box 入站 / 出站累计流量
 

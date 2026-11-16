@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.16.1"
+SCRIPT_VERSION="2026.11.16.2"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1621,6 +1621,8 @@ free_port() {
 # ---------- 添加节点 ----------
 add_reality() {
   local tag port sni uuid keys priv pub sid obj host fps
+  echo "本项会在本机创建 VLESS + Reality + Vision 服务端入站；本机地址、UUID、Reality 密钥和 short_id 用于新建节点，不会复用示例链接里的远端服务器凭据。"
+  echo "客户端 URI 参数 packetEncoding=xudp 属于出站侧设置，不是本机入站字段；sing-box 客户端默认使用 xudp。"
   ask_tag tag reality
   prompt port "TCP 端口" "$(free_port 443 tcp)"
   check_port "$port" tcp
@@ -3244,7 +3246,7 @@ menu() {
     echo
     echo "========== sing-box 多协议管理 ${SCRIPT_VERSION} =========="
     echo "Telegram: https://t.me/tuiji_channel"
-    echo "1) 添加 VLESS + Reality"
+    echo "1) 添加本机 VLESS + Reality + Vision 入站"
     echo "2) 添加 Hysteria2"
     echo "3) 添加 TUIC"
     echo "4) 添加 AnyTLS"
