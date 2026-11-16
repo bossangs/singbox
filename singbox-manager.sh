@@ -1624,7 +1624,7 @@ add_reality() {
   ask_tag tag reality
   prompt port "TCP 端口" "$(free_port 443 tcp)"
   check_port "$port" tcp
-  prompt sni "Reality SNI/握手域名" "www.cloudflare.com"
+  prompt sni "Reality SNI/握手域名" "www.bing.com"
   choose_fps fps chrome reality
   host="$(public_host)"
   uuid="$(new_uuid)"
@@ -1889,7 +1889,7 @@ manual_landing() {
   valid_port "$p" || die "端口无效"
   h="$(uri_host "$h")"
   case "$c" in
-    1) prompt a "UUID" ""; prompt b "SNI（握手域名）" "www.cloudflare.com"; prompt c2 "公钥 public_key（pbk）" ""; prompt d "short_id（sid，可留空）" " "
+    1) prompt a "UUID" ""; prompt b "SNI（握手域名）" "www.bing.com"; prompt c2 "公钥 public_key（pbk）" ""; prompt d "short_id（sid，可留空）" " "
        d="${d// /}"
        link="vless://$(urlencode "$a")@${h}:${p}?encryption=none&security=reality&sni=$(urlencode "$b")&fp=chrome&pbk=$(urlencode "$c2")&sid=$(urlencode "$d")&type=tcp&flow=xtls-rprx-vision" ;;
     2) prompt a "密码" ""; prompt b "SNI（可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
