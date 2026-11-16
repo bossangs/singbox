@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.16.2"
+SCRIPT_VERSION="2026.11.16.3"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -3241,12 +3241,37 @@ singbox-manager ${SCRIPT_VERSION}
   version          显示脚本版本
 TXT
 }
+add_single_inbound() {
+  local choice
+  echo "选择要添加的本机入站协议（直接回车默认 VLESS + Reality）："
+  echo "1) VLESS + Reality 入站（Vision）[默认]"
+  echo "2) Hysteria2"
+  echo "3) TUIC"
+  echo "4) AnyTLS"
+  echo "5) Shadowsocks"
+  echo "6) Telegram SOCKS5（不支持 MTProto）"
+  echo "7) VLESS + TLS 入站（Xray；默认 XHTTP auto）"
+  if ! read -r -p "选择 [1-7，默认 1]: " choice; then
+    echo "没有选择，已取消。"
+    return 0
+  fi
+  case "${choice:-1}" in
+    1) add_reality ;;
+    2) add_hy2 ;;
+    3) add_tuic ;;
+    4) add_anytls ;;
+    5) add_ss ;;
+    6) add_telegram_socks ;;
+    7) xray_add_node ;;
+    *) echo "无效选项，没有添加入站。" ;;
+  esac
+}
 menu() {
   while true; do
     echo
     echo "========== sing-box 多协议管理 ${SCRIPT_VERSION} =========="
     echo "Telegram: https://t.me/tuiji_channel"
-    echo "1) 添加本机 VLESS + Reality + Vision 入站"
+    echo "1) 添加单个本机入站（默认 VLESS + Reality 入站，可切换其他协议）"
     echo "2) 添加 Hysteria2"
     echo "3) 添加 TUIC"
     echo "4) 添加 AnyTLS"
@@ -3265,7 +3290,7 @@ menu() {
     echo "17) 中转 / 端口转发"
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
-    echo "20) 添加 VLESS + TLS（Xray；默认 XHTTP auto）"
+    echo "20) 添加本机 VLESS + TLS 入站（Xray；默认 XHTTP auto）"
     echo "21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64"
     echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
@@ -3274,7 +3299,7 @@ menu() {
     echo "0) 退出"
     read -r -p "选择 [0-25]: " choice || exit 0
     case "$choice" in
-      1) add_reality ;;
+      1) add_single_inbound ;;
       2) add_hy2 ;;
       3) add_tuic ;;
       4) add_anytls ;;
