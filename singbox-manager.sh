@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.13.2"
+SCRIPT_VERSION="2026.11.16.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -3209,7 +3209,7 @@ singbox-manager ${SCRIPT_VERSION}
 用法：$(self_cmd) [命令]
 
   （不带命令）     打开管理菜单
-  install          安装依赖、sing-box、系统服务（systemd 或 OpenRC）和 sb 快捷命令
+  install          Linux 安装管理器；FreeBSD 使用 pkg 安装 sing-box（管理菜单仍不支持）
   menu             打开管理菜单
   5|ss|add-ss      直接添加 Shadowsocks 节点（安装后也可运行 sb5）
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
@@ -3328,6 +3328,18 @@ main() {
   detect_init
   case "${1:-menu}" in
     install)
+      if [[ "$(uname -s)" == FreeBSD ]]; then
+        have pkg || die "没有找到 FreeBSD pkg；请先在系统上初始化 pkg 后重试"
+        echo "正在通过 FreeBSD 官方软件包安装 sing-box……"
+        pkg install -y sing-box
+        need_sb
+        "$SB" version
+        cat <<'TXT'
+FreeBSD sing-box 软件包已安装。该脚本的管理菜单目前仍只支持 Debian/Ubuntu 和 Alpine；
+FreeBSD 软件包自带 rc.d 服务，名称为 singbox，默认配置路径为 /usr/local/etc/sing-box.json。
+TXT
+        exit 0
+      fi
       [[ -r /etc/os-release ]] || die "无法识别系统"
       . /etc/os-release
       [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* || "${ID:-}" == "alpine" ]] || die "此安装器目前支持 Debian/Ubuntu 系和 Alpine"
