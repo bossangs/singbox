@@ -57,6 +57,7 @@ sb
 | 4 | AnyTLS | TCP | 10443 | 使用自签证书；可选多个 TLS 指纹 |
 | 5 | Shadowsocks | TCP | 11443 | 支持 `aes-128-gcm`（默认）、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm` |
 | 6 | Telegram SOCKS5 | TCP | 1080 | sing-box SOCKS5 入站，自动生成用户名和密码；**不支持 MTProto** |
+| 20 / 菜单 1 选项 7 | 本机 VLESS + TLS 入站（Xray） | TCP | 8443 | 必须填写解析到本服务器的域名；连接地址、TLS/SNI 和证书都使用该域名 |
 
 UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里没有写死任何密码。
 菜单 **1** 的单个入站选择器可选上述 6 种 sing-box 协议，也可选 Xray VLESS + TLS；菜单 **2–6** 和 **20** 仍是对应协议的快捷添加项。
@@ -86,7 +87,7 @@ Telegram: https://t.me/tuiji_channel
 17) 中转 / 端口转发
 18) 修改节点 TLS 指纹（多指纹分享链接）
 19) 修改节点端口
-20) 添加本机 VLESS + TLS 入站（Xray；默认 XHTTP auto）
+20) 添加本机 VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）
 21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64
 22) 自动选择并启用服务器 TCP BBR（需要确认）
 23) 查看管理脚本/节点数据/备份/日志占用
@@ -105,6 +106,7 @@ Telegram: https://t.me/tuiji_channel
 
 - 在菜单 **1** 中选择入站协议（1–6 为 sing-box 协议，7 为 Xray VLESS + TLS），并设置端口；脚本会检查端口是否已被占用。Telegram SOCKS5 名称会自动从本地 sing-box 入站 tag 生成；没有合适 tag 时回退到服务器地址/主机名，并可选自定义名称（直接回车使用自动名称）。其他协议仍按提示输入名称。
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
+- 本机 Xray VLESS + TLS 入站必须输入有效域名；生成的客户端连接地址、TLS/SNI 和证书都会使用它。请先把域名解析到这台服务器。
 - Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
 - Reality 需要填写 SNI / 握手域名；Hysteria2、TUIC、AnyTLS 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址）；Shadowsocks 需要选择加密方式。
 - Telegram SOCKS5 会生成随机用户名和密码，并输出 Telegram 官方 `https://t.me/socks?...` 与 `tg://socks?...` 一键添加链接，同时保留手动参数。

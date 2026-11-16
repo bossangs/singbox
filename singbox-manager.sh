@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.16.3"
+SCRIPT_VERSION="2026.11.16.4"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1250,7 +1250,7 @@ xray_make_cert() {
   printf '%s\n%s\n%s' "$cert" "$key" "$fingerprint"
 }
 xray_add_node() {
-  local tag host port choice network uri_type cert_result cert key fingerprint uuid path vhost service_name transport obj meta
+  local tag host port choice network uri_type cert_result cert key fingerprint uuid path vhost service_name transport obj meta TLS_HOST
   xray_prepare
   ask_tag tag xray-tls
   prompt port "Xray TCP 端口" "$(xray_free_port 8443)"
@@ -1260,9 +1260,9 @@ xray_add_node() {
   port_in_config "$port" && die "端口 $port 已被 sing-box 节点占用"
   xray_port_in_config "$port" && die "端口 $port 已被其他 Xray 节点占用"
   port_free "$port" tcp || die "端口 $port/tcp 已被其他程序占用"
-  host="$(public_host)"
-  prompt TLS_HOST "证书域名或 IP（自签证书会按此生成）" "$host"
-  valid_host "$TLS_HOST" || die "证书域名/IP 格式无效"
+  prompt TLS_HOST "VLESS + TLS 域名（需解析到本服务器；用于连接地址、SNI 和证书）" ""
+  valid_domain "$TLS_HOST" || die "VLESS + TLS 入站必须使用有效域名，不能填 IP"
+  host="$TLS_HOST"
   echo "Xray + TLS 传输方式（默认优选 XHTTP auto）："
   echo "1) XHTTP / auto（推荐）"
   echo "2) RAW/TCP"
@@ -3250,7 +3250,7 @@ add_single_inbound() {
   echo "4) AnyTLS"
   echo "5) Shadowsocks"
   echo "6) Telegram SOCKS5（不支持 MTProto）"
-  echo "7) VLESS + TLS 入站（Xray；默认 XHTTP auto）"
+  echo "7) VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
   if ! read -r -p "选择 [1-7，默认 1]: " choice; then
     echo "没有选择，已取消。"
     return 0
@@ -3290,7 +3290,7 @@ menu() {
     echo "17) 中转 / 端口转发"
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
-    echo "20) 添加本机 VLESS + TLS 入站（Xray；默认 XHTTP auto）"
+    echo "20) 添加本机 VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
     echo "21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64"
     echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
