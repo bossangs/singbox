@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.18.3"
+SCRIPT_VERSION="2026.11.18.4"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -25,7 +25,7 @@ XRAY_SERVICE="singbox-xray"
 XRAY_UNIT="/etc/systemd/system/singbox-xray.service"
 XRAY_INIT="/etc/init.d/singbox-xray"
 XRAY_LOG="/var/log/singbox-xray.log"
-RAW_URL="https://github.com/bossangs/singbox/raw/refs/heads/main/singbox-manager.sh"
+RAW_URL="https://api.github.com/repos/bossangs/singbox/contents/singbox-manager.sh?ref=main"
 SHORTCUT="/usr/local/bin/sb"
 SS_SHORTCUT="/usr/local/bin/sb5"
 CONF_DIR="/etc/sing-box"
@@ -184,8 +184,8 @@ install_ss_shortcut() {
 }
 fetch_latest() {
   # 下载最新脚本到 $1，并做语法和身份检查
-  local dest="$1" url="${RAW_URL}?cache=$(date +%s)-${RANDOM}"
-  curl -fsSL --max-time 30 "$url" -o "$dest" || { rm -f "$dest"; die "下载失败：$url"; }
+  local dest="$1" url="${RAW_URL}&cache=$(date +%s)-${RANDOM}"
+  curl -fsSL -H 'Accept: application/vnd.github.raw' --max-time 30 "$url" -o "$dest" || { rm -f "$dest"; die "下载失败：$url"; }
   bash -n "$dest" || { rm -f "$dest"; die "下载的脚本语法检查失败，未更新"; }
   is_our_script "$dest" || { rm -f "$dest"; die "下载的文件不是本脚本，未更新"; }
 }
