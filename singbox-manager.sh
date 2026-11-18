@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # @bossangs-singbox-manager
-# singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu (systemd) and Alpine (OpenRC)
+# singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu and AlmaLinux (systemd), plus Alpine (OpenRC)
 # https://github.com/bossangs/singbox
 # Supports sing-box protocols plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.16.4"
+SCRIPT_VERSION="2026.11.18.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -353,16 +353,22 @@ is_dangling() { [[ -L "$1" && ! -e "$1" ]]; }
 dir_has_files() { [[ -d "$1" ]] && [[ -n "$(find "$1" -mindepth 1 -print -quit 2>/dev/null)" ]]; }
 conf_is_ours() { [[ -f "$CONF" ]] && jq -e '.inbounds | type == "array"' "$CONF" >/dev/null 2>&1; }
 pkg_owns() {
-  # Debian 13 是 usr 合并布局：/lib 就是 /usr/lib，dpkg 里两种路径都可能出现
+  # Debian 13 是 usr 合并布局；RPM 查询也尝试真实路径，兼容 /lib -> /usr/lib
   local c
   if have apk && ! have dpkg; then
     apk info -q --who-owns "$1" >/dev/null 2>&1
     return
   fi
-  have dpkg || return 1
-  for c in "$1" "$(readlink -f "$1" 2>/dev/null || true)" "/usr${1#/usr}" "${1#/usr}"; do
-    [[ -n "$c" ]] && dpkg -S "$c" >/dev/null 2>&1 && return 0
-  done
+  if have dpkg; then
+    for c in "$1" "$(readlink -f "$1" 2>/dev/null || true)" "/usr${1#/usr}" "${1#/usr}"; do
+      [[ -n "$c" ]] && dpkg -S "$c" >/dev/null 2>&1 && return 0
+    done
+  fi
+  if have rpm; then
+    for c in "$1" "$(readlink -f "$1" 2>/dev/null || true)" "/usr${1#/usr}" "${1#/usr}"; do
+      [[ -n "$c" ]] && rpm -qf "$c" >/dev/null 2>&1 && return 0
+    done
+  fi
   return 1
 }
 
@@ -527,7 +533,9 @@ conflict_report() {
   else
     stop_cmd="systemctl stop sing-box"
     disable_cmd="systemctl disable --now sing-box"
-    purge_cmd="dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box"
+    if have dnf; then purge_cmd="rpm -q sing-box >/dev/null 2>&1 && dnf remove -y sing-box"
+    elif have yum; then purge_cmd="rpm -q sing-box >/dev/null 2>&1 && yum remove -y sing-box"
+    else purge_cmd="dpkg -s sing-box >/dev/null 2>&1 && apt-get purge -y sing-box"; fi
     svc_files="/etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service /lib/systemd/system/sing-box.service"
     reload_cmd="systemctl daemon-reload"
   fi
@@ -635,9 +643,21 @@ install_deps() {
     apk add bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc unzip
     return
   fi
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y ca-certificates curl jq openssl iproute2 unzip
+  if have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ca-certificates curl jq openssl iproute2 unzip
+    return
+  fi
+  if have dnf || have yum; then
+    local -a packages=(ca-certificates jq openssl iproute unzip)
+    # AlmaLinux minimal 可能预装 curl-minimal；curl 已可用时避免与 curl RPM 冲突
+    have curl || packages+=(curl)
+    if have dnf; then dnf install -y "${packages[@]}"
+    else yum install -y "${packages[@]}"; fi
+    return
+  fi
+  die "未找到 apk、apt-get、dnf 或 yum，无法自动安装依赖"
 }
 latest_sb_version() {
   # 通过 releases/latest 的跳转读取版本号，不占用 GitHub API 次数
@@ -993,8 +1013,11 @@ xray_ensure_unzip() {
     if ! apt-get install -y unzip; then
       apt-get update && apt-get install -y unzip || die "Debian/Ubuntu 安装 unzip 失败；请检查 apt 源和网络后重试"
     fi
+  elif have dnf || have yum; then
+    if have dnf; then dnf install -y unzip || die "AlmaLinux 安装 unzip 失败；请检查 DNF 软件源和网络后重试"
+    else yum install -y unzip || die "RPM 系统安装 unzip 失败；请检查 YUM 软件源和网络后重试"; fi
   else
-    die "未找到 apk 或 apt-get，无法自动安装 unzip"
+    die "未找到 apk、apt-get、dnf 或 yum，无法自动安装 unzip"
   fi
   have unzip || die "安装命令已结束，但仍未找到 unzip"
   echo "unzip 已就绪。"
@@ -3362,14 +3385,14 @@ main() {
         need_sb
         "$SB" version
         cat <<'TXT'
-FreeBSD sing-box 软件包已安装。该脚本的管理菜单目前仍只支持 Debian/Ubuntu 和 Alpine；
+FreeBSD sing-box 软件包已安装。该脚本的管理菜单目前仍只支持 Debian/Ubuntu、AlmaLinux 和 Alpine；
 FreeBSD 软件包自带 rc.d 服务，名称为 singbox，默认配置路径为 /usr/local/etc/sing-box.json。
 TXT
         exit 0
       fi
       [[ -r /etc/os-release ]] || die "无法识别系统"
       . /etc/os-release
-      [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* || "${ID:-}" == "alpine" ]] || die "此安装器目前支持 Debian/Ubuntu 系和 Alpine"
+      [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* || "${ID:-}" == "almalinux" || "${ID:-}" == "alpine" ]] || die "此安装器目前支持 Debian/Ubuntu 系、AlmaLinux 和 Alpine"
       install_deps
       detect_init
       need_init

@@ -1,6 +1,6 @@
 # singbox
 
-一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
+一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu、AlmaLinux（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
 
 > 下面所有代码块里的命令都可以整行复制直接运行，不需要去掉任何序号或提示符。请先切换到 root：
 
@@ -13,6 +13,17 @@ sudo -i
 ### Debian / Ubuntu
 
 ```bash
+curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
+chmod +x singbox-manager.sh
+./singbox-manager.sh install
+```
+
+### AlmaLinux
+
+以 root 运行。若系统没有 `curl` 命令，先用 DNF 安装；安装器会自动通过 DNF 安装其余依赖和 sing-box RPM 包：
+
+```bash
+command -v curl >/dev/null 2>&1 || dnf install -y curl
 curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
@@ -37,14 +48,14 @@ sb
 
 `install` 会做这些事：
 
-- 安装依赖。Debian / Ubuntu 用 apt 装 `ca-certificates curl jq openssl iproute2`；Alpine 用 apk 装 `bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc`（Alpine 自带的是精简版工具，脚本需要完整版）
+- 安装依赖。Debian / Ubuntu 用 apt 装 `ca-certificates curl jq openssl iproute2`；AlmaLinux 用 DNF 装 `ca-certificates jq openssl iproute unzip`（仅在没有 `curl` 命令时额外安装 curl）；Alpine 用 apk 装 `bash ca-certificates curl jq openssl iproute2 coreutils findutils tar grep sed openrc`（Alpine 自带的是精简版工具，脚本需要完整版）
 - 先检查服务器上有没有其他 sing-box 一键脚本（见下文“已装过其他 sing-box 脚本”），有的话直接停下，不改动任何文件
 - 如果还没有 sing-box，安装最新版内核，最新版本号直接从 GitHub 发布页读取，不受 GitHub API 次数限制：
-  - Debian / Ubuntu：用官方安装脚本 `https://sing-box.app/install.sh` 装官方 deb 包；没装成时改用官方发布的压缩包
+  - Debian / Ubuntu：用官方安装脚本 `https://sing-box.app/install.sh` 装官方 deb 包；AlmaLinux：用该官方脚本安装 RPM 包；两者失败时都改用官方发布的压缩包
   - Alpine：依次尝试官方发布的压缩包（musl 版，装到 `/usr/bin/sing-box`）→ 官方 apk 包 → Alpine 软件源里的 sing-box。官方 apk 包在 Alpine 3.21 等较老版本上会报 `IO ERROR`，所以优先用压缩包。每一步装完都会实际运行一次 sing-box 确认能用，才算成功
   - 如果 `/usr/bin/sing-box` 已经存在（例如你自己从官方压缩包装好的），就直接使用它，只创建配置、服务和快捷命令
 - 生成初始配置 `/etc/sing-box/config.json`；如果官方安装包带了示例节点，会先备份再移除（见“注意事项”）
-- 校验配置，设置开机自启并启动 `sing-box` 服务（Debian 用 systemd，Alpine 用 OpenRC）
+- 校验配置，设置开机自启并启动 `sing-box` 服务（Debian / Ubuntu / AlmaLinux 用 systemd，Alpine 用 OpenRC）
 - 创建快捷命令 `sb`（`/usr/local/bin/sb`），并创建直接添加 Shadowsocks 的 `sb5`（`/usr/local/bin/sb5`）；若 `sb5` 已被其他文件或命令占用，不会覆盖
 
 ## 支持的协议
@@ -531,7 +542,7 @@ nft list ruleset
 | `/etc/sing-box/manager/relays/` | 中转和端口转发记录 |
 | `/etc/sing-box/certs/` | 自签证书 |
 | `/var/backups/sing-box-manager/` | 配置备份 |
-| `/etc/systemd/system/sing-box.service` | Debian：systemd 服务（只在官方安装包没有提供时才由脚本创建） |
+| `/etc/systemd/system/sing-box.service` | Debian / Ubuntu / AlmaLinux：systemd 服务（只在官方安装包没有提供时才由脚本创建） |
 | `/etc/init.d/sing-box` | Alpine：OpenRC 服务（优先使用官方 apk 包自带的，没有时由脚本创建） |
 | `/etc/conf.d/sing-box` | Alpine：OpenRC 服务设置（含日志位置；看门狗启用时可加 `respawn_max=0` 管理块） |
 | `/var/log/sing-box.log` | Alpine：sing-box 日志 |
