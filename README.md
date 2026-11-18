@@ -13,18 +13,18 @@ sudo -i
 ### Debian / Ubuntu
 
 ```bash
-curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
+curl -fsSL -o singbox-manager.sh https://github.com/bossangs/singbox/raw/refs/heads/main/singbox-manager.sh
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
 ```
 
 ### AlmaLinux
 
-以 root 运行。若系统没有 `curl` 命令，先用 DNF 安装；下载链接带有缓存规避参数，避免拿到旧版安装器。安装器会自动通过 DNF 安装其余依赖和 sing-box RPM 包：
+以 root 运行。若系统没有 `curl` 命令，先用 DNF 安装；下载使用 GitHub 文件路由，避免拿到缓存中的旧版安装器。安装器会自动通过 DNF 安装其余依赖和 sing-box RPM 包：
 
 ```bash
 command -v curl >/dev/null 2>&1 || dnf install -y curl
-curl -fsSL -o singbox-manager.sh "https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh?cache=$(date +%s)-$RANDOM"
+curl -fsSL -o singbox-manager.sh "https://github.com/bossangs/singbox/raw/refs/heads/main/singbox-manager.sh?cache=$(date +%s)-$RANDOM"
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
 ```
@@ -35,7 +35,7 @@ Alpine 默认没有 bash 和 curl，先装上这两个，其余步骤一样：
 
 ```bash
 apk add bash curl
-curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
+curl -fsSL -o singbox-manager.sh https://github.com/bossangs/singbox/raw/refs/heads/main/singbox-manager.sh
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
 ```

@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.18.2"
+SCRIPT_VERSION="2026.11.18.3"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -25,7 +25,7 @@ XRAY_SERVICE="singbox-xray"
 XRAY_UNIT="/etc/systemd/system/singbox-xray.service"
 XRAY_INIT="/etc/init.d/singbox-xray"
 XRAY_LOG="/var/log/singbox-xray.log"
-RAW_URL="https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh"
+RAW_URL="https://github.com/bossangs/singbox/raw/refs/heads/main/singbox-manager.sh"
 SHORTCUT="/usr/local/bin/sb"
 SS_SHORTCUT="/usr/local/bin/sb5"
 CONF_DIR="/etc/sing-box"
