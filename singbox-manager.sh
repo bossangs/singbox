@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.18.1"
+SCRIPT_VERSION="2026.11.18.2"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -70,6 +70,16 @@ WATCHDOG_LOG="/var/log/singbox-manager-watchdog.log"
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo -i"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+is_supported_install_os() {
+  case "${ID:-}" in
+    debian|ubuntu|almalinux|alpine) return 0 ;;
+  esac
+  # AlmaLinux/Rocky/CentOS 等可能只通过 ID_LIKE 声明 RHEL 兼容性
+  case " ${ID_LIKE:-} " in
+    *" debian "*|*" rhel "*|*" centos "*) return 0 ;;
+  esac
+  return 1
+}
 detect_init() {
   if have systemctl && [[ -d /run/systemd/system ]]; then INIT_SYS=systemd
   elif have rc-service && { have openrc-run || [[ -x /sbin/openrc-run ]]; }; then INIT_SYS=openrc
@@ -174,8 +184,8 @@ install_ss_shortcut() {
 }
 fetch_latest() {
   # 下载最新脚本到 $1，并做语法和身份检查
-  local dest="$1"
-  curl -fsSL --max-time 30 "$RAW_URL" -o "$dest" || { rm -f "$dest"; die "下载失败：$RAW_URL"; }
+  local dest="$1" url="${RAW_URL}?cache=$(date +%s)-${RANDOM}"
+  curl -fsSL --max-time 30 "$url" -o "$dest" || { rm -f "$dest"; die "下载失败：$url"; }
   bash -n "$dest" || { rm -f "$dest"; die "下载的脚本语法检查失败，未更新"; }
   is_our_script "$dest" || { rm -f "$dest"; die "下载的文件不是本脚本，未更新"; }
 }
@@ -3392,7 +3402,7 @@ TXT
       fi
       [[ -r /etc/os-release ]] || die "无法识别系统"
       . /etc/os-release
-      [[ "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* || "${ID:-}" == "almalinux" || "${ID:-}" == "alpine" ]] || die "此安装器目前支持 Debian/Ubuntu 系、AlmaLinux 和 Alpine"
+      is_supported_install_os || die "此安装器目前支持 Debian/Ubuntu 系、AlmaLinux/RHEL 兼容系和 Alpine"
       install_deps
       detect_init
       need_init

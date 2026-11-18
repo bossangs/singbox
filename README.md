@@ -1,6 +1,6 @@
 # singbox
 
-一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu、AlmaLinux（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
+一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu、AlmaLinux/RHEL 兼容发行版（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
 
 > 下面所有代码块里的命令都可以整行复制直接运行，不需要去掉任何序号或提示符。请先切换到 root：
 
@@ -20,11 +20,11 @@ chmod +x singbox-manager.sh
 
 ### AlmaLinux
 
-以 root 运行。若系统没有 `curl` 命令，先用 DNF 安装；安装器会自动通过 DNF 安装其余依赖和 sing-box RPM 包：
+以 root 运行。若系统没有 `curl` 命令，先用 DNF 安装；下载链接带有缓存规避参数，避免拿到旧版安装器。安装器会自动通过 DNF 安装其余依赖和 sing-box RPM 包：
 
 ```bash
 command -v curl >/dev/null 2>&1 || dnf install -y curl
-curl -fsSL -o singbox-manager.sh https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh
+curl -fsSL -o singbox-manager.sh "https://raw.githubusercontent.com/bossangs/singbox/main/singbox-manager.sh?cache=$(date +%s)-$RANDOM"
 chmod +x singbox-manager.sh
 ./singbox-manager.sh install
 ```
