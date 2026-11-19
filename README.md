@@ -69,9 +69,10 @@ sb
 | 5 | Shadowsocks | TCP | 11443 | 支持 `aes-128-gcm`（默认）、`aes-256-gcm`、`chacha20-ietf-poly1305`、`2022-blake3-aes-128-gcm`、`2022-blake3-aes-256-gcm` |
 | 6 | Telegram SOCKS5 | TCP | 1080 | sing-box SOCKS5 入站，自动生成用户名和密码；**不支持 MTProto** |
 | 20 / 菜单 1 选项 7 | 本机 VLESS + TLS 入站（Xray） | TCP | 8443 | 必须填写解析到本服务器的域名；连接地址、TLS/SNI 和证书都使用该域名 |
+| 26 / 菜单 1 选项 8 | VMess AEAD | TCP | 10086 | 标准 VMess `vmess://` 分享链接；`alterId=0`，不启用 TLS，连接到本机公网地址 |
 
 UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里没有写死任何密码。
-菜单 **1** 的单个入站选择器可选上述 6 种 sing-box 协议，也可选 Xray VLESS + TLS；菜单 **2–6** 和 **20** 仍是对应协议的快捷添加项。
+菜单 **1** 的单个入站选择器可选上述 7 种 sing-box 协议，也可选 Xray VLESS + TLS；菜单 **2–6**、**20** 和 **26** 是对应协议的快捷添加项。VMess 使用标准 AEAD（`alterId=0`）和 TCP 直连，不启用 TLS。
 Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提供兼容的 SOCKS5，不会把它称作 MTProto。
 
 ## 管理菜单
@@ -99,15 +100,16 @@ Telegram: https://t.me/tuiji_channel
 18) 修改节点 TLS 指纹（多指纹分享链接）
 19) 修改节点端口
 20) 添加本机 VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）
-21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64
+21) 批量添加全部 8 类节点并输出 v2rayNG / NekoBox 两组 Base64
 22) 自动选择并启用服务器 TCP BBR（需要确认）
 23) 查看管理脚本/节点数据/备份/日志占用
 24) 节点服务保活/看门狗（启用/状态/检查/停用）
 25) 查看 sing-box 入/出累计流量
+26) 添加 VMess AEAD（TCP；alterId=0）
 0) 退出
 ```
 
-菜单 **1** 会先让你选择要添加的本机入站协议；直接回车默认创建 VLESS + Reality + Vision，也可选择 Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5 或 VLESS + TLS 入站。菜单 **2–6** 和 **20** 仍可直接添加对应协议。VLESS + Reality 入站的服务器地址自动识别或按需填写，UUID、Reality 密钥和 short ID 在本机生成，SNI 与客户端指纹可配置。示例链接里的 `packetEncoding=xudp` 是客户端 VLESS 出站设置，不是服务端入站字段；sing-box 客户端默认使用 xudp，因此本机入站不需要单独配置它。
+菜单 **1** 会先让你选择要添加的本机入站协议；直接回车默认创建 VLESS + Reality + Vision，也可选择 Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、VLESS + TLS 或 VMess AEAD。菜单 **2–6**、**20** 和 **26** 仍可直接添加对应协议。VMess 以 TCP 直连本机公网地址，使用 `alterId=0`，并生成标准 `vmess://` 链接。VLESS + Reality 入站的服务器地址自动识别或按需填写，UUID、Reality 密钥和 short ID 在本机生成，SNI 与客户端指纹可配置。示例链接里的 `packetEncoding=xudp` 是客户端 VLESS 出站设置，不是服务端入站字段；sing-box 客户端默认使用 xudp，因此本机入站不需要单独配置它。
 
 ### sing-box 入站 / 出站累计流量
 
@@ -115,7 +117,7 @@ Telegram: https://t.me/tuiji_channel
 
 ### 添加节点的流程
 
-- 在菜单 **1** 中选择入站协议（1–6 为 sing-box 协议，7 为 Xray VLESS + TLS），并设置端口；脚本会检查端口是否已被占用。Telegram SOCKS5 名称会自动从本地 sing-box 入站 tag 生成；没有合适 tag 时回退到服务器地址/主机名，并可选自定义名称（直接回车使用自动名称）。其他协议仍按提示输入名称。
+- 在菜单 **1** 中选择入站协议（1–6 和 8 为 sing-box 协议，7 为 Xray VLESS + TLS），并设置端口；脚本会检查端口是否已被占用。VMess 使用 TCP、`alterId=0`，默认端口为 `10086`；Telegram SOCKS5 名称会自动从本地 sing-box 入站 tag 生成；没有合适 tag 时回退到服务器地址/主机名，并可选自定义名称（直接回车使用自动名称）。其他协议仍按提示输入名称。
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
 - 本机 Xray VLESS + TLS 入站必须输入有效域名；生成的客户端连接地址、TLS/SNI 和证书都会使用它。请先把域名解析到这台服务器。
 - Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
@@ -126,12 +128,12 @@ Telegram: https://t.me/tuiji_channel
 
 ### 批量添加全部协议节点
 
-管理菜单选 **21**，或运行 `sb add-all`，可以按顺序新增本脚本支持的全部 7 类节点：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5，以及 Xray VLESS + TLS（默认 XHTTP auto）。开始前会要求输入 `y` 确认；随后沿用各协议原有的添加流程，逐项询问需要的名称、端口、TLS 域名或传输参数，并在每个节点创建成功后立即显示它的分享链接。第一次创建 Xray 节点时会额外安装独立的 Xray sidecar。
+管理菜单选 **21**，或运行 `sb add-all`，可以按顺序新增本脚本支持的全部 8 类节点：VLESS + Reality、VMess AEAD/TCP、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5，以及 Xray VLESS + TLS（默认 XHTTP auto）。开始前会要求输入 `y` 确认；随后沿用各协议原有的添加流程，逐项询问需要的名称、端口、TLS 域名或传输参数，并在每个节点创建成功后立即显示它的分享链接。第一次创建 Xray 节点时会额外安装独立的 Xray sidecar。
 
-七类节点全部创建成功后，脚本会输出两条按客户端分组的 Base64 内容，解码后每行是一条分享链接：
+八类节点全部创建成功后，脚本会输出两条按客户端分组的 Base64 内容，解码后每行是一条分享链接：
 
-- **v2rayNG**：VLESS + Reality、Shadowsocks。
-- **NekoBox / sing-box**：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks。Reality 和 Shadowsocks 会同时出现在两组中。
+- **v2rayNG**：VLESS + Reality、VMess、Shadowsocks。
+- **NekoBox / sing-box**：VLESS + Reality、VMess、Hysteria2、TUIC、AnyTLS、Shadowsocks。Reality、VMess 和 Shadowsocks 会同时出现在两组中。
 
 Telegram SOCKS5 不进入任何一组。Xray VLESS + TLS/XHTTP 也暂不放入两组：NekoBox 官方项目仍未提供稳定的 XHTTP 支持；v2rayNG 虽使用 Xray core，但它的分享链接导入不支持本脚本用于自签证书校验的 `pcs` pin，不能安全地直接导入该节点。脚本不会把它改成跳过证书验证的链接。
 
@@ -279,9 +281,9 @@ sb relay add
 
 操作流程：
 
-- **粘贴落地节点的分享链接**。支持 `vless://`（Reality / TLS / 无加密，tcp / ws / grpc / http / httpupgrade）、`hysteria2://` 或 `hy2://`、`tuic://`、`anytls://`、`ss://`，本脚本生成的链接都能直接用。在落地机上运行 `sb links` 就能看到它的链接。
+- **粘贴落地节点的分享链接**。支持 `vless://`（Reality / TLS / 无加密，tcp / ws / grpc / http / httpupgrade）、VMess TCP `vmess://`、`hysteria2://` 或 `hy2://`、`tuic://`、`anytls://`、`ss://`，本脚本生成的链接都能直接用。在落地机上运行 `sb links` 就能看到它的链接。
 - 没有链接时直接回车，改为**手动填写**：选择落地协议，再填地址、端口、UUID / 密码等。
-- 落地是 TCP 协议（VLESS、AnyTLS、Shadowsocks）时，脚本会测试从中转机能不能连上落地端口，连不上只提示，不会阻止添加。
+- 落地是 TCP 协议（VLESS、VMess、AnyTLS、Shadowsocks）时，脚本会测试从中转机能不能连上落地端口，连不上只提示，不会阻止添加。
 - 选择**中转入口协议**（客户端连接中转机用的协议，1-5，和添加普通节点一样），填写名称和端口。名称默认是 `relay-reality-1`、`relay-hy2-1` 这样的格式。
 - 脚本先备份配置，再添加入口、落地出站和只针对这个入口的路由规则，用 `sing-box check` 校验，失败自动恢复。
 - 屏幕上会显示**给客户端用的分享链接**，地址是中转机的公网 IP。客户端导入这个链接即可。
@@ -328,7 +330,8 @@ sb relay del
 | `sb` | 打开管理菜单 |
 | `sb5` | 直接添加 Shadowsocks 节点；也可运行 `sb 5`、`sb ss` 或 `sb add-ss` |
 | `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
-| `sb add-all` | 逐项新增全部 7 类节点，最后输出 v2rayNG 与 NekoBox/sing-box 两组 Base64 内容 |
+| `sb vmess` / `sb add-vmess` | 添加 VMess AEAD/TCP 直连节点（默认端口 `10086`） |
+| `sb add-all` | 逐项新增全部 8 类节点，最后输出 v2rayNG 与 NekoBox/sing-box 两组 Base64 内容 |
 | `sb bbr` | 自动选择内核支持的标准 TCP BBR；确认后应用并持久化 |
 | `sb bbr status` / `sb bbr reset` | 查看 BBR 状态，或恢复修改前的拥塞控制算法 |
 | `sb storage` / `sb disk` | 统计管理器相关脚本、节点数据、备份和日志占用（只读） |
@@ -494,7 +497,7 @@ systemctl disable --now caddy
 
 脚本**不会**自动修改防火墙，你需要只放行实际使用的端口：
 
-- Reality / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
+- Reality / VMess / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
 - Hysteria2 / TUIC：UDP
 - 端口转发：按添加时选择的 `tcp` / `udp` / `both` 放行
 

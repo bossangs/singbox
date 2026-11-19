@@ -2,14 +2,14 @@
 # @bossangs-singbox-manager
 # singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu and AlmaLinux (systemd), plus Alpine (OpenRC)
 # https://github.com/bossangs/singbox
-# Supports sing-box protocols plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
+# Supports native sing-box protocols including VMess, plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
 # If another sing-box one-click script is detected, nothing is changed; cleanup steps are printed instead.
 
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.19.1"
+SCRIPT_VERSION="2026.11.19.6"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1476,6 +1476,14 @@ print_link() {
   proto="$(jq -r '.protocol' "$f")"
   h="$(uri_host "$(jq -r '.server' "$f")")"
   case "$proto" in
+    VMess)
+      echo "分享链接（标准 VMess URI；TCP + AEAD，alterId=0）："
+      local vmess_json
+      vmess_json="$(jq -nc --arg tag "$(jq -r '.tag' "$f")" --arg host "$(jq -r '.server' "$f")" \
+        --arg port "$(jq -r '.port' "$f")" --arg uuid "$(jq -r '.uuid' "$f")" \
+        '{v:"2",ps:$tag,add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"",sni:""}')"
+      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w0)"
+      ;;
     "VLESS + Reality")
       if (( $(jq '(.fps // [.fp // "chrome"]) | length' "$f") > 1 )); then
         echo "分享链接（标准 VLESS Reality URI，每个指纹一条）："
@@ -1546,11 +1554,11 @@ print_client_payload() {
   for f in "$@"; do
     proto="$(jq -r '.protocol // empty' "$f")"
     case "$client:$proto" in
-      "v2rayNG:VLESS + Reality"|"v2rayNG:Shadowsocks") ;;
-      "NekoBox/sing-box:VLESS + Reality"|"NekoBox/sing-box:Hysteria2"|"NekoBox/sing-box:TUIC"|"NekoBox/sing-box:AnyTLS"|"NekoBox/sing-box:Shadowsocks") ;;
+      "v2rayNG:VLESS + Reality"|"v2rayNG:VMess"|"v2rayNG:Shadowsocks") ;;
+      "NekoBox/sing-box:VLESS + Reality"|"NekoBox/sing-box:VMess"|"NekoBox/sing-box:Hysteria2"|"NekoBox/sing-box:TUIC"|"NekoBox/sing-box:AnyTLS"|"NekoBox/sing-box:Shadowsocks") ;;
       *) continue ;;
     esac
-    print_link "$f" | grep -E '^(vless|hysteria2|hy2|tuic|anytls|ss)://' >>"$tmp" || true
+    print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss)://' >>"$tmp" || true
   done
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1676,6 +1684,21 @@ add_reality() {
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg host "$host" --argjson port "$port" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" --argjson fps "$(fps_json "$fps")" \
     '{protocol:"VLESS + Reality",tag:$tag,server:$host,port:$port,uuid:$uuid,flow:"xtls-rprx-vision",security:"reality",sni:$sni,public_key:$pub,short_id:$sid,fps:$fps}')"
 }
+add_vmess() {
+  local tag port uuid obj host
+  echo "本项会创建标准 VMess AEAD（alterId=0）TCP 入站，不启用 TLS；服务器地址和 UUID 会生成 VMess 分享链接。"
+  ask_tag tag vmess
+  prompt port "TCP 端口" "$(free_port 10086 tcp)"
+  check_port "$port" tcp
+  port="$((10#$port))"
+  host="$(public_host)"
+  uuid="$(new_uuid)"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
+    '{type:"vmess",tag:$tag,listen:"::",listen_port:$port,users:[{name:$tag,uuid:$uuid,alterId:0}]}')"
+  apply_json "$obj"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg uuid "$uuid" \
+    '{protocol:"VMess",tag:$tag,server:$host,port:$port,uuid:$uuid,alter_id:0,security:"auto",network:"tcp"}')"
+}
 add_hy2() {
   local tag port password obj host
   ask_tag tag hy2
@@ -1768,33 +1791,36 @@ add_all_protocols() {
   local confirm
   local created_files=()
   cat <<'TXT'
-这会依次新增 7 类节点：VLESS + Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、Xray VLESS + TLS（默认 XHTTP auto）。
+这会依次新增 8 类节点：VLESS + Reality、VMess、Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、Xray VLESS + TLS（默认 XHTTP auto）。
 每类节点都会沿用原有添加流程，逐项询问名称、端口或 TLS 参数并立即保存配置、显示分享链接；首次创建 Xray 节点时会安装独立 Xray sidecar。
 各节点分别提交；若中途失败，之前成功创建的节点会保留，尚未执行的类型不会创建。端口仍需自行在防火墙和云安全组放行。
 TXT
   read -r -p "确认开始批量新增全部协议节点？输入 y 继续 [y/N]: " confirm || confirm=""
   case "${confirm,,}" in y|yes) ;; *) echo "已取消，没有新增节点。"; return 0 ;; esac
-  echo "[1/7] VLESS + Reality"
+  echo "[1/8] VLESS + Reality"
   add_reality
   created_files+=("$DATA/$LAST_TAG.json")
-  echo "[2/7] Hysteria2"
+  echo "[2/8] VMess"
+  add_vmess
+  created_files+=("$DATA/$LAST_TAG.json")
+  echo "[3/8] Hysteria2"
   add_hy2
   created_files+=("$DATA/$LAST_TAG.json")
-  echo "[3/7] TUIC"
+  echo "[4/8] TUIC"
   add_tuic
   created_files+=("$DATA/$LAST_TAG.json")
-  echo "[4/7] AnyTLS"
+  echo "[5/8] AnyTLS"
   add_anytls
   created_files+=("$DATA/$LAST_TAG.json")
-  echo "[5/7] Shadowsocks"
+  echo "[6/8] Shadowsocks"
   add_ss
   created_files+=("$DATA/$LAST_TAG.json")
-  echo "[6/7] Telegram SOCKS5"
+  echo "[7/8] Telegram SOCKS5"
   add_telegram_socks
-  echo "[7/7] Xray VLESS + TLS"
+  echo "[8/8] Xray VLESS + TLS"
   xray_add_node
   created_files+=("$XRAY_DATA/$LAST_TAG.json")
-  echo "全部 7 类节点均已创建，以上已逐项显示分享链接。"
+  echo "全部 8 类节点均已创建，以上已逐项显示分享链接。"
   print_client_payload "v2rayNG" "${created_files[@]}"
   print_client_payload "NekoBox/sing-box" "${created_files[@]}"
   echo "Telegram SOCKS5 与 Xray VLESS + TLS/XHTTP 均未放入这两组：前者不纳入聚合；后者的自签证书 pcs pin 不能由 v2rayNG 当前导入流程可靠识别，NekoBox/sing-box 当前也无稳定的 XHTTP 支持。"
@@ -1813,12 +1839,41 @@ declare -A LQ=()
 L_SCHEME="" L_UI="" L_HOST="" L_PORT="" L_PATH="" L_QUERY=""
 PARSED_OUT="" PARSED_DESC="" PARSED_PROTO=""
 parse_share_link() {
-  # 解析 vless / hysteria2 / hy2 / tuic / anytls / ss 链接，生成 sing-box 出站，结果放在 PARSED_OUT
-  local link="$1" rest frag="" hp kv k v arr=() dec ui
+  # 解析 vless / vmess / hysteria2 / hy2 / tuic / anytls / ss 链接，生成 sing-box 出站，结果放在 PARSED_OUT
+  local link="$1" rest frag="" hp kv k v arr=() dec ui vmess_raw vmess_net vmess_tls vmess_security vmess_aid vmess_sni vmess_host vmess_ins
   link="${link//[[:space:]]/}"
-  [[ "$link" == *://* ]] || die "这不是分享链接（应以 vless:// hysteria2:// tuic:// anytls:// ss:// 开头）"
+  [[ "$link" == *://* ]] || die "这不是分享链接（应以 vless:// vmess:// hysteria2:// tuic:// anytls:// ss:// 开头）"
   L_SCHEME="${link%%://*}"; L_SCHEME="${L_SCHEME,,}"
   rest="${link#*://}"
+  if [[ "$L_SCHEME" == vmess ]]; then
+    # 标准 VMess 分享链接是 Base64(JSON)，目前中转解析支持 TCP（可选 TLS）。
+    rest="${rest%%#*}"
+    vmess_raw="$(b64d "$rest")"
+    jq -e 'type == "object" and ((.add | type) == "string" and (.add | length) > 0) and ((.id | type) == "string" and (.id | length) > 0) and (.port != null)' <<<"$vmess_raw" >/dev/null 2>&1 || die "无法解析 VMess 分享链接（应为 vmess://Base64(JSON)）"
+    L_HOST="$(jq -r '.add' <<<"$vmess_raw")"
+    L_PORT="$(jq -r '.port | tostring' <<<"$vmess_raw")"
+    L_UI="$(jq -r '.id' <<<"$vmess_raw")"
+    valid_host "$L_HOST" || die "VMess 链接里的服务器地址无效：$L_HOST"
+    valid_port "$L_PORT" || die "VMess 链接里的端口无效：$L_PORT"
+    L_PORT="$((10#$L_PORT))"
+    vmess_net="$(jq -r '.net // "tcp" | ascii_downcase' <<<"$vmess_raw")"
+    case "$vmess_net" in tcp|raw) ;; *) die "VMess 中转目前仅支持 TCP 传输；该链接使用 net=$vmess_net" ;; esac
+    vmess_tls="$(jq -r '.tls // "" | ascii_downcase' <<<"$vmess_raw")"
+    case "$vmess_tls" in ""|none|tls) ;; *) die "不支持 VMess TLS 模式：$vmess_tls" ;; esac
+    vmess_security="$(jq -r '.scy // .security // "auto" | ascii_downcase' <<<"$vmess_raw")"
+    case "$vmess_security" in auto|none|zero|aes-128-gcm|chacha20-poly1305|aes-128-ctr) ;; *) die "不支持的 VMess 加密方式：$vmess_security" ;; esac
+    vmess_aid="$(jq -r '.aid // .alterId // 0 | tostring' <<<"$vmess_raw")"
+    [[ "$vmess_aid" =~ ^[0-9]+$ ]] || die "VMess 链接里的 alterId 无效"
+    vmess_host="$(jq -r '.host // empty' <<<"$vmess_raw")"
+    vmess_sni="$(jq -r '.sni // empty' <<<"$vmess_raw")"
+    vmess_ins="$(jq -r 'if .allowInsecure == true or .allowInsecure == 1 or .allowInsecure == "true" then "true" else "false" end' <<<"$vmess_raw")"
+    PARSED_PROTO="VMess"
+    PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg uuid "$L_UI" --arg security "$vmess_security" --argjson aid "$vmess_aid" --arg tls "$vmess_tls" --arg sni "$vmess_sni" --arg host "$vmess_host" --arg ins "$vmess_ins" '
+      {type:"vmess",server:$server,server_port:$port,uuid:$uuid,security:$security,alter_id:$aid,network:"tcp"}
+      + (if $tls == "tls" then {tls:{enabled:true,server_name:(if $sni != "" then $sni elif $host != "" then $host else $server end),insecure:($ins == "true")}} else {} end)')"
+    PARSED_DESC="$PARSED_PROTO $(uri_host "$L_HOST"):$L_PORT"
+    return 0
+  fi
   if [[ "$rest" == *"#"* ]]; then frag="${rest#*#}"; rest="${rest%%#*}"; fi
   : "$frag"
   L_QUERY=""
@@ -1915,10 +1970,10 @@ parse_share_link() {
 }
 manual_landing() {
   # 手动填写落地节点，拼成分享链接后交给 parse_share_link
-  local c h p a b c2 d link
+  local c h p a b c2 d link vmess_json vmess_host
   echo "落地节点协议："
-  echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks"
-  read -r -p "选择 [1-5]: " c || die "没有选择协议"
+  echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks   6) VMess TCP"
+  read -r -p "选择 [1-6]: " c || die "没有选择协议"
   prompt h "落地服务器地址（IP 或域名）" ""
   h="${h#[}"; h="${h%]}"
   valid_host "$h" || die "地址无效"
@@ -1937,13 +1992,18 @@ manual_landing() {
        link="anytls://$(urlencode "$a")@${h}:${p}/?sni=$(urlencode "$b")&insecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
     5) prompt b "加密方式" "aes-128-gcm"; prompt a "密码" ""
        link="ss://$(printf '%s:%s' "$b" "$a" | base64 -w0)@${h}:${p}" ;;
+    6) prompt a "VMess UUID" ""
+       vmess_host="${h#[}"; vmess_host="${vmess_host%]}"
+       vmess_json="$(jq -nc --arg host "$vmess_host" --arg port "$p" --arg uuid "$a" \
+         '{v:"2",ps:"relay",add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"",sni:""}')"
+       link="vmess://$(printf '%s' "$vmess_json" | base64 -w0)" ;;
     *) die "无效选项" ;;
   esac
   parse_share_link "$link"
 }
 read_landing() {
   local link
-  echo "落地节点：粘贴分享链接（vless / hysteria2 / hy2 / tuic / anytls / ss），直接回车改为手动填写。"
+  echo "落地节点：粘贴分享链接（vless / vmess TCP / hysteria2 / hy2 / tuic / anytls / ss），直接回车改为手动填写。"
   read -r -p "落地节点分享链接: " link || link=""
   if [[ -n "${link//[[:space:]]/}" ]]; then parse_share_link "$link"; else manual_landing; fi
   echo "落地节点：$PARSED_DESC"
@@ -1957,7 +2017,7 @@ relay_add() {
   read_landing
   landing_host="$L_HOST"; landing_port="$L_PORT"; proto="$PARSED_PROTO"
   case "$PARSED_OUT" in
-    *'"type":"vless"'*|*'"type":"anytls"'*|*'"type":"shadowsocks"'*)
+    *'"type":"vless"'*|*'"type":"vmess"'*|*'"type":"anytls"'*|*'"type":"shadowsocks"'*)
       if tcp_reachable "$landing_host" "$landing_port"; then echo "落地端口 TCP 可以连通。"
       else echo "提示：从本机连不上落地 ${landing_host}:${landing_port}（TCP），请确认落地节点在运行、防火墙已放行。仍会继续添加。"; fi ;;
   esac
@@ -3257,7 +3317,8 @@ singbox-manager ${SCRIPT_VERSION}
   5|ss|add-ss      直接添加 Shadowsocks 节点（安装后也可运行 sb5）
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
   links            查看所有节点的参数和分享链接
-  add-all          新增全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
+  vmess|add-vmess  添加 VMess AEAD（TCP）节点
+  add-all          新增全部 8 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
   bbr [status|reset] 自动选用内核支持的标准 TCP BBR；status 查看，reset 恢复
   storage          统计管理脚本、节点数据、备份和日志的磁盘占用（只读）
   traffic [show|disable] 查看/启停 sing-box 入站与出站累计流量
@@ -3292,7 +3353,8 @@ add_single_inbound() {
   echo "5) Shadowsocks"
   echo "6) Telegram SOCKS5（不支持 MTProto）"
   echo "7) VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
-  if ! read -r -p "选择 [1-7，默认 1]: " choice; then
+  echo "8) VMess AEAD 入站（TCP；alterId=0）"
+  if ! read -r -p "选择 [1-8，默认 1]: " choice; then
     echo "没有选择，已取消。"
     return 0
   fi
@@ -3304,6 +3366,7 @@ add_single_inbound() {
     5) add_ss ;;
     6) add_telegram_socks ;;
     7) xray_add_node ;;
+    8) add_vmess ;;
     *) echo "无效选项，没有添加入站。" ;;
   esac
 }
@@ -3332,13 +3395,14 @@ menu() {
     echo "18) 修改节点 TLS 指纹（多指纹分享链接）"
     echo "19) 修改节点端口"
     echo "20) 添加本机 VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
-    echo "21) 批量添加全部 7 类节点并输出 v2rayNG / NekoBox 两组 Base64"
+    echo "21) 批量添加全部 8 类节点并输出 v2rayNG / NekoBox 两组 Base64"
     echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
     echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
     echo "25) 查看 sing-box 入/出累计流量"
+    echo "26) 添加 VMess AEAD（TCP；alterId=0）"
     echo "0) 退出"
-    read -r -p "选择 [0-25]: " choice || exit 0
+    read -r -p "选择 [0-26]: " choice || exit 0
     case "$choice" in
       1) add_single_inbound ;;
       2) add_hy2 ;;
@@ -3365,6 +3429,7 @@ menu() {
       23) cmd_storage ;;
       24) watchdog_menu ;;
       25) cmd_traffic show ;;
+      26) add_vmess ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -3429,6 +3494,7 @@ TXT
       ;;
     menu) prepare_manage; menu ;;
     5|ss|shadowsocks|add-ss|sb5) prepare_manage; add_ss ;;
+    vmess|add-vmess) prepare_manage; add_vmess ;;
     relay)
       prepare_manage
       case "${2:-menu}" in
