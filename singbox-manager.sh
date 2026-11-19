@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.18.4"
+SCRIPT_VERSION="2026.11.19.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1375,10 +1375,12 @@ xray_remove_node() {
   echo "已删除 Xray 节点：$tag（其他 sing-box 节点不受影响）"
 }
 xray_change_port() {
-  local tag="$1" new="$2" meta old tmp
+  local tag="$1" new="$2" meta old tmp host
   meta="$XRAY_DATA/$tag.json"
   [[ -f "$meta" ]] || die "没有名为 $tag 的 Xray 节点"
   old="$(jq -r .port "$meta")"
+  host="$(jq -r '.sni // empty' "$meta")"
+  valid_domain "$host" || die "Xray 节点 $tag 缺少有效的证书域名，未修改端口"
   if [[ -z "$new" ]]; then new="$(xray_free_port "$((old + 1))")"; prompt new "新 Xray TCP 端口" "$new"; fi
   valid_port "$new" || die "端口必须是 1-65535 的数字"
   new="$((10#$new))"
@@ -1389,7 +1391,7 @@ xray_change_port() {
   port_free "$new" tcp || die "端口 $new/tcp 已被其他程序占用"
   xray_commit_jq "$new" --arg t "$tag" --argjson p "$new" '.inbounds |= map(if .tag == $t then .port = $p else . end)'
   tmp="$meta.tmp"
-  jq --argjson p "$new" --arg h "$(public_host)" '.port=$p | .server=$h' "$meta" >"$tmp"
+  jq --argjson p "$new" --arg h "$host" '.port=$p | .server=$h' "$meta" >"$tmp"
   install -m 600 "$tmp" "$meta"; rm -f "$tmp"
   echo "已把 Xray 节点 $tag 的端口从 $old 改为 $new。"
   print_link "$meta"
@@ -2643,8 +2645,8 @@ remove_node() {
   remove_by_tag "$tag"
 }
 show_links() {
-  # 显示每个节点的参数和分享链接；服务器地址统一使用当前保存的地址
-  local f host
+  # sing-box 节点使用当前保存的服务器地址；Xray TLS 必须保留证书对应的 SNI 域名。
+  local f host tls_host
   shopt -s nullglob
   local files=("$DATA"/*.json)
   shopt -u nullglob
@@ -2665,8 +2667,14 @@ show_links() {
   done
   if compgen -G "$XRAY_DATA/*.json" >/dev/null; then
     for f in "$XRAY_DATA"/*.json; do
-      if [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
-        jq --arg h "$host" '.server=$h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"; rm -f "$f.tmp"
+      tls_host="$(jq -r '.sni // empty' "$f")"
+      if valid_domain "$tls_host"; then
+        if [[ "$(jq -r '.server // empty' "$f")" != "$tls_host" ]]; then
+          jq --arg h "$tls_host" '.server=$h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"
+          rm -f "$f.tmp"
+        fi
+      else
+        echo "警告：Xray 节点 $(basename "$f" .json) 的证书域名无效，未自动覆盖其连接地址。" >&2
       fi
       echo "===== $(basename "$f" .json) [Xray] ====="
       jq . "$f"
