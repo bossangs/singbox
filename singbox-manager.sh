@@ -2,14 +2,17 @@
 # @bossangs-singbox-manager
 # singbox-manager.sh — sing-box multi-protocol manager for Debian/Ubuntu and AlmaLinux (systemd), plus Alpine (OpenRC)
 # https://github.com/bossangs/singbox
-# Supports native sing-box protocols including VMess, plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
+# Supports native sing-box protocols (VLESS Reality, VMess, Hysteria2, TUIC, AnyTLS, Shadowsocks, Trojan), Cloudflare
+# Argo/cloudflared tunnels, plus an isolated Xray sidecar for VLESS + TLS transports (XHTTP preferred).
+# Every node type can be added from the menu or from non-interactive CLI flags, and every node type can be used as a
+# relay entry or relay/forward landing node.
 # Existing configs are backed up before each change. Firewall rules are not changed automatically.
 # If another sing-box one-click script is detected, nothing is changed; cleanup steps are printed instead.
 
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.19.6"
+SCRIPT_VERSION="2026.11.20.1"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -66,6 +69,30 @@ WATCHDOG_SINGBOX_DROPIN="/etc/systemd/system/sing-box.service.d/90-singbox-manag
 WATCHDOG_XRAY_DROPIN="/etc/systemd/system/singbox-xray.service.d/90-singbox-manager-watchdog.conf"
 WATCHDOG_OPENRC_INIT="/etc/init.d/singbox-manager-watchdog"
 WATCHDOG_LOG="/var/log/singbox-manager-watchdog.log"
+# Argo（Cloudflare Tunnel / cloudflared）节点
+ARGO_BIN="/usr/local/bin/cloudflared"
+ARGO_DIR="$DATA/argo"
+ARGO_MARK="# @bossangs-singbox-manager-argo"
+ARGO_SERVICE=""
+ARGO_UNIT=""
+ARGO_INIT=""
+ARGO_LOG_FILE=""
+ARGO_TOKEN_FILE=""
+# Telegram 机器人
+TG_SERVICE="sing-box-tgbot"
+TG_MARK="# @bossangs-singbox-manager-tgbot"
+TG_UNIT="/etc/systemd/system/${TG_SERVICE}.service"
+TG_INIT="/etc/init.d/${TG_SERVICE}"
+TG_LOG="/var/log/${TG_SERVICE}.log"
+TG_API="https://api.telegram.org"
+TG_BOT_TOKEN=""
+TG_CHAT_ID=""
+TG_AUTO_PUSH=0
+TG_SUPPRESS_AUTOPUSH=""
+# Reality SNI 扫描（结果缓存）
+SNI_CACHE="$DATA/sni-scan.json"
+SNI_BEST=""
+SNI_REGION=""
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo -i"; }
@@ -131,6 +158,74 @@ new_uuid() { "$SB" generate uuid; }
 prompt() { local __var="$1" __label="$2" __default="${3:-}"; local __v; if [[ -n "$__default" ]]; then read -r -p "$__label [$__default]: " __v; __v="${__v:-$__default}"; else read -r -p "$__label: " __v; fi; printf -v "$__var" '%s' "$__v"; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
 valid_tag() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "节点名称仅允许字母、数字、下划线和短横线，最长 40 字符"; }
+
+# ---------- 非交互参数 ----------
+# 菜单和原有子命令的用法完全不变；这里只是让同一套添加流程也能用 --选项 直接跑完。
+declare -A OPTS=()
+PARGS=()
+NONINT=0
+BOOL_OPTS=" yes non-interactive self-signed auto quick json help auto-push tg-push "
+optv() {
+  # 依次取第一个非空的选项值，没有时输出空（始终返回 0，避免 set -e 误退出）
+  local x
+  for x in "$@"; do
+    if [[ -n "${OPTS[$x]:-}" ]]; then printf '%s' "${OPTS[$x]}"; return 0; fi
+  done
+  return 0
+}
+opt_bool() {
+  local x
+  for x in "$@"; do [[ -n "${OPTS[$x]:-}" ]] && return 0; done
+  return 1
+}
+parse_opts() {
+  # --名称 值 / --名称=值 / -y 解析到 OPTS，其余参数按原顺序放进 PARGS
+  local a k
+  OPTS=(); PARGS=(); NONINT=0
+  while (( $# )); do
+    a="$1"
+    case "$a" in
+      -y|--yes) NONINT=1; OPTS[yes]=1; shift ;;
+      --non-interactive) NONINT=1; OPTS[non-interactive]=1; shift ;;
+      -h|--help) OPTS[help]=1; shift ;;
+      --*=*) k="${a%%=*}"; k="${k#--}"; OPTS["${k,,}"]="${a#*=}"; shift ;;
+      --*)
+        k="${a#--}"; k="${k,,}"
+        if [[ " $BOOL_OPTS " == *" $k "* ]]; then
+          OPTS["$k"]=1; shift
+        else
+          (( $# >= 2 )) || die "选项 --$k 后面缺少取值（例如：--$k 值）"
+          OPTS["$k"]="$2"; shift 2
+        fi ;;
+      -*) die "不认识的选项：$a（运行 $(self_cmd) help 查看用法）" ;;
+      *) PARGS+=("$a"); shift ;;
+    esac
+  done
+  [[ -n "${OPTS[yes]:-}${OPTS[non-interactive]:-}" ]] && NONINT=1
+  return 0
+}
+ask_value() {
+  # $1 变量名；$2 提示文字；$3 默认值；其余参数为可接受的选项名（如 port listen-port）
+  local __name="$1" __label="$2" __def="$3" __v
+  shift 3
+  __v="$(optv "$@")"
+  if [[ -z "$__v" ]]; then
+    if (( NONINT )); then __v="$__def"; else prompt __v "$__label" "$__def"; fi
+  fi
+  printf -v "$__name" '%s' "$__v"
+}
+ask_port() {
+  # $1 变量名；$2 提示文字；$3 默认端口；$4 tcp / udp / both
+  local __name="$1" __label="$2" __def="$3" __proto="$4" __p
+  __p="$(optv port listen-port)"
+  if [[ -z "$__p" ]]; then
+    if (( NONINT )); then __p="$__def"; else prompt __p "$__label" "$__def"; fi
+  fi
+  valid_port "$__p" || die "端口必须是 1-65535 的数字"
+  __p="$((10#$__p))"
+  check_port "$__p" "$__proto"
+  printf -v "$__name" '%s' "$__p"
+}
 
 self_cmd() {
   # 给用户看的“再次运行本脚本”的命令
@@ -972,22 +1067,72 @@ apply_json() {
         | .route.rules = ([{inbound: [$obj.tag], outbound: $to}] + (.route.rules // []))
       else . end'
 }
-ask_tls_host() {
-  # $1：默认值（服务器地址）
-  prompt TLS_HOST "证书中的域名或服务器 IP（自签证书，客户端将使用 insecure）" "${1:-}"
-  [[ -n "$TLS_HOST" ]] || die "域名/IP 不能为空"
-  local san
-  if valid_ipv4 "$TLS_HOST" || valid_ipv6 "$TLS_HOST"; then
-    san="IP:${TLS_HOST}"
-  else
-    san="DNS:${TLS_HOST}"
+# ---------- TLS 证书（自签 / 已有证书） ----------
+TLS_HOST="" TLS_CERT="" TLS_KEY="" TLS_INS="1"
+cert_self_signed() {
+  # $1：节点名（用于证书文件名）；$2：证书域名或 IP。结果写 TLS_CERT / TLS_KEY
+  local tag="$1" host="$2" san cert key
+  mkdir -p "$CERT_DIR"
+  cert="$CERT_DIR/$tag.crt"; key="$CERT_DIR/$tag.key"
+  if [[ -e "$cert" || -e "$key" ]]; then
+    die "证书文件已存在（$tag），为保护现有文件未覆盖；请换一个节点名，或改用 --cert/--key 指定已有证书"
   fi
-  if [[ ! -s "$CERT_DIR/server.crt" || ! -s "$CERT_DIR/server.key" ]]; then
-    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 825 \
-      -keyout "$CERT_DIR/server.key" -out "$CERT_DIR/server.crt" \
-      -subj "/CN=${TLS_HOST}" -addext "subjectAltName=${san}" >/dev/null 2>&1
-    chmod 600 "$CERT_DIR/server.key"
-    chmod 644 "$CERT_DIR/server.crt"
+  if valid_ipv4 "$host" || valid_ipv6 "$host"; then san="IP:${host}"; else san="DNS:${host}"; fi
+  if ! openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 825 \
+    -keyout "$key" -out "$cert" -subj "/CN=${host}" -addext "subjectAltName=${san}" >/dev/null 2>&1; then
+    rm -f "$cert" "$key"
+    die "生成自签证书失败（域名：$host）"
+  fi
+  chmod 600 "$key"
+  chmod 644 "$cert"
+  TLS_CERT="$cert"; TLS_KEY="$key"
+}
+setup_tls() {
+  # $1：节点名。确定证书域名与证书文件，结果写 TLS_HOST / TLS_CERT / TLS_KEY / TLS_INS
+  # --domain/--sni 指定证书域名；--cert/--key 使用已有证书；--self-signed 强制自签
+  local tag="$1" def host cert key choice
+  def="$(public_host)"
+  host="$(optv domain tls-host cert-host)"
+  if [[ -z "$host" ]]; then
+    if (( NONINT )); then host="$def"; else prompt host "证书中的域名或服务器 IP（自签证书时客户端将使用 insecure）" "$def"; fi
+  fi
+  host="${host#[}"; host="${host%]}"
+  valid_host "$host" || die "证书域名/IP 无效：$host"
+  TLS_HOST="$host"
+  cert="$(optv cert)"; key="$(optv key)"
+  if [[ -n "$cert" || -n "$key" ]]; then
+    [[ -n "$cert" && -n "$key" ]] || die "使用已有证书时必须同时提供 --cert 和 --key"
+    [[ -r "$cert" && -s "$cert" ]] || die "证书文件不可读：$cert"
+    [[ -r "$key" && -s "$key" ]] || die "私钥文件不可读：$key"
+    grep -q 'BEGIN CERTIFICATE' "$cert" 2>/dev/null || die "证书文件里没有 PEM 证书：$cert"
+    TLS_INS=0
+  elif opt_bool self-signed || (( NONINT )); then
+    cert_self_signed "$tag" "$host"
+    TLS_INS=1
+  else
+    echo "证书方式："
+    echo "1) 自签证书（默认；客户端需要允许不安全证书 insecure）"
+    echo "2) 已有证书文件（例如 acme.sh / Let's Encrypt 签发，客户端正常校验证书）"
+    read -r -p "选择 [1-2，默认 1]: " choice || choice=1
+    if [[ "${choice:-1}" == 2 ]]; then
+      prompt cert "证书文件（fullchain.pem 或 cert.pem）" ""
+      prompt key "私钥文件（privkey.pem）" ""
+      [[ -r "$cert" && -s "$cert" ]] || die "证书文件不可读：$cert"
+      [[ -r "$key" && -s "$key" ]] || die "私钥文件不可读：$key"
+      TLS_INS=0
+    else
+      cert_self_signed "$tag" "$host"
+      TLS_INS=1
+    fi
+  fi
+  if [[ -z "$TLS_CERT" ]]; then
+    [[ -n "$cert" && -n "$key" ]] || die "证书文件路径为空"
+    TLS_CERT="$cert"; TLS_KEY="$key"
+  fi
+  if (( TLS_INS )); then
+    echo "证书：自签（$TLS_CERT，CN/SAN=$host，有效期 825 天），分享链接会带 insecure=1。"
+  else
+    echo "证书：$TLS_CERT（有效期请自行确认；分享链接不带 insecure）。"
   fi
 }
 xray_arch() {
@@ -1514,15 +1659,56 @@ print_link() {
       echo "提示：pcs 是证书 SHA-256 pin（不是跳过验证）；客户端需支持 Xray 分享链接提案中的 pcs 参数。"
       ;;
     Hysteria2)
-      echo "分享链接（自签证书，客户端需允许不安全证书）："
-      jq -r --arg h "$h" '"hysteria2://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
+      if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
+        echo "分享链接（使用受信任证书）："
+        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)#\(.tag)"' "$f"
+      else
+        echo "分享链接（自签证书，客户端需允许不安全证书）："
+        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f"
+      fi ;;
     TUIC)
-      echo "分享链接（自签证书，客户端需允许不安全证书）："
-      jq -r --arg h "$h" '"tuic://\(.uuid):\(.password)@\($h):\(.port)?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=\(.sni)#\(.tag)"' "$f" ;;
+      if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
+        echo "分享链接（使用受信任证书）："
+        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&sni=\(.sni)#\(.tag)"' "$f"
+      else
+        echo "分享链接（自签证书，客户端需允许不安全证书）："
+        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=\(.sni)#\(.tag)"' "$f"
+      fi ;;
     AnyTLS)
-      echo "分享链接（不同客户端 URI 参数可能不同，请核对客户端文档）："
-      jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
-        | "anytls://\(.password)@\($h):\(.port)/?insecure=1&sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
+      if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
+        echo "分享链接（使用受信任证书；不同客户端 URI 参数可能不同，请核对客户端文档）："
+        jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
+          | "anytls://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
+      else
+        echo "分享链接（自签证书，客户端需允许不安全证书；不同客户端 URI 参数可能不同，请核对客户端文档）："
+        jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
+          | "anytls://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
+      fi ;;
+    Trojan)
+      if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
+        echo "分享链接（Trojan over TLS，使用受信任证书）："
+        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp#\(.tag)"' "$f"
+      else
+        echo "分享链接（自签证书，客户端需允许不安全证书）："
+        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp&allowInsecure=1#\(.tag)"' "$f"
+      fi ;;
+    "VMess + WS (Argo)")
+      local vmess_json
+      echo "分享链接（VMess + WebSocket + TLS，经 Cloudflare Argo 隧道）："
+      vmess_json="$(jq -nc --arg tag "$(jq -r '.tag' "$f")" --arg host "$(jq -r '.server' "$f")" \
+        --arg path "$(jq -r '.path' "$f")" --arg ws "$(jq -r '.ws_host // .server' "$f")" --arg uuid "$(jq -r '.uuid' "$f")" \
+        '{v:"2",ps:$tag,add:$host,port:"443",id:$uuid,aid:"0",scy:"auto",net:"ws",type:"none",host:$ws,path:$path,tls:"tls",sni:$ws}')"
+      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w0)"
+      ;;
+    "VLESS + WS (Argo)")
+      local ahost apath atag
+      ahost="$(urlencode "$(jq -r '.ws_host // .server' "$f")")"
+      apath="$(urlencode "$(jq -r '.path' "$f")")"
+      atag="$(urlencode "$(jq -r '.tag' "$f")")"
+      echo "分享链接（VLESS + WebSocket + TLS，经 Cloudflare Argo 隧道）："
+      printf 'vless://%s@%s:443?encryption=none&security=tls&type=ws&host=%s&path=%s&sni=%s#%s\n' \
+        "$(urlencode "$(jq -r '.uuid' "$f")")" "$h" "$ahost" "$apath" "$ahost" "$atag"
+      ;;
     Shadowsocks)
       userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 -w0)"
       echo "分享链接："
@@ -1554,11 +1740,11 @@ print_client_payload() {
   for f in "$@"; do
     proto="$(jq -r '.protocol // empty' "$f")"
     case "$client:$proto" in
-      "v2rayNG:VLESS + Reality"|"v2rayNG:VMess"|"v2rayNG:Shadowsocks") ;;
-      "NekoBox/sing-box:VLESS + Reality"|"NekoBox/sing-box:VMess"|"NekoBox/sing-box:Hysteria2"|"NekoBox/sing-box:TUIC"|"NekoBox/sing-box:AnyTLS"|"NekoBox/sing-box:Shadowsocks") ;;
+      "v2rayNG:VLESS + Reality"|"v2rayNG:VMess"|"v2rayNG:Shadowsocks"|"v2rayNG:Trojan"|"v2rayNG:VMess + WS (Argo)"|"v2rayNG:VLESS + WS (Argo)") ;;
+      "NekoBox/sing-box:VLESS + Reality"|"NekoBox/sing-box:VMess"|"NekoBox/sing-box:Hysteria2"|"NekoBox/sing-box:TUIC"|"NekoBox/sing-box:AnyTLS"|"NekoBox/sing-box:Shadowsocks"|"NekoBox/sing-box:Trojan"|"NekoBox/sing-box:VMess + WS (Argo)"|"NekoBox/sing-box:VLESS + WS (Argo)") ;;
       *) continue ;;
     esac
-    print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss)://' >>"$tmp" || true
+    print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss|trojan)://' >>"$tmp" || true
   done
   if [[ ! -s "$tmp" ]]; then
     rm -f "$tmp"
@@ -1579,6 +1765,7 @@ save_node() {
   LAST_TAG="$1"
   jq . "$f"
   print_link "$f"
+  tg_maybe_autopush "$1" || true
 }
 
 # ---------- TLS 指纹（uTLS） ----------
@@ -1661,15 +1848,327 @@ free_port() {
   printf '%s' "$1"
 }
 
+# ---------- Reality SNI 扫描 ----------
+# 候选域名按分类和地区分组；每个域名都从本 VPS 自己独立验证 TLS 1.3 / X25519 / HTTP/2 / 证书链。
+SNI_ROWS=()
+sni_cat() {
+  case "${1,,}" in
+    big-tech|bigtech|大厂|科技)
+      echo "www.bing.com www.microsoft.com www.apple.com www.amazon.com aws.amazon.com azure.microsoft.com login.live.com www.icloud.com www.cloudflare.com" ;;
+    cdn|cdn-saas|saas)
+      echo "www.fastly.com cdn.jsdelivr.net unpkg.com cdnjs.cloudflare.com www.akamai.com www.digitalocean.com www.cloudflare.com" ;;
+    dev|dev-tools|工具)
+      echo "github.com gitlab.com registry.npmjs.org www.npmjs.com hub.docker.com pypi.org www.python.org nodejs.org stackoverflow.com" ;;
+    media|streaming|流媒体)
+      echo "www.netflix.com open.spotify.com www.twitch.tv www.youtube.com www.disneyplus.com www.vimeo.com" ;;
+    ecom|e-commerce|电商)
+      echo "www.rakuten.co.jp shopee.sg www.allegro.pl www.mercadolibre.com www.ebay.com www.aliexpress.com" ;;
+    all|全部)
+      echo "$(sni_cat big-tech) $(sni_cat cdn) $(sni_cat dev) $(sni_cat media) $(sni_cat ecom)" ;;
+    *) return 1 ;;
+  esac
+}
+sni_categories() { echo "big-tech cdn dev media ecom all"; }
+sni_region_extra() {
+  case "${1^^}" in
+    US) echo "www.verizon.com www.walmart.com www.usps.com" ;;
+    JP) echo "www.yahoo.co.jp www.rakuten.co.jp www.sony.jp www.nicovideo.jp" ;;
+    SG) echo "www.shopee.sg www.straitstimes.com www.dbs.com.sg" ;;
+    HK) echo "www.hk01.com www.openrice.com www.hktvmall.com" ;;
+    KR) echo "www.naver.com www.daum.net www.coupang.com" ;;
+    DE) echo "www.spiegel.de www.heise.de www.deutschebahn.com" ;;
+    GB) echo "www.bbc.co.uk www.theguardian.com www.gov.uk" ;;
+    FR) echo "www.lemonde.fr www.orange.fr www.fnac.com" ;;
+    NL) echo "www.nu.nl www.bol.com" ;;
+    TW) echo "www.pchome.com.tw www.books.com.tw" ;;
+    CA) echo "www.cbc.ca www.canada.ca" ;;
+    AU) echo "www.abc.net.au www.seek.com.au" ;;
+    RU) echo "www.yandex.ru www.ozon.ru" ;;
+    IN) echo "www.flipkart.com www.indiatimes.com" ;;
+    BR) echo "www.globo.com www.uol.com.br" ;;
+    *) echo "" ;;
+  esac
+}
+sni_detect_region() {
+  # 读取本机出口 IP 的国家代码（两个字母）；失败时输出空
+  local r
+  for u in https://api.country.is/ https://ipinfo.io/country https://ifconfig.co/country-iso https://ipapi.co/country/; do
+    r="$(curl -fsS --max-time 6 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$r" == \{* ]] && r="$(printf '%s' "$r" | jq -r '.country // empty' 2>/dev/null || true)"
+    r="${r^^}"
+    [[ "$r" =~ ^[A-Z]{2}$ ]] && { printf '%s' "$r"; return 0; }
+  done
+  return 0
+}
+sni_ca_file() {
+  local f
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /etc/ssl/certs/ca-bundle.crt; do
+    [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 0
+}
+sni_probe() {
+  # $1 域名；输出一行制表符分隔：域名 结果 延迟ms TLS13 X25519 H2 证书 说明
+  local d="$1" out="" rc=0 start end ms=0 tls=0 kx=0 h2=0 cert=0 certtxt="bad" note="" ca pem
+  local -a args
+  ca="$(sni_ca_file)"
+  args=(-connect "${d}:443" -servername "$d" -tls1_3 -groups X25519 -alpn h2 -showcerts -verify_hostname "$d")
+  [[ -n "$ca" ]] && args+=(-CAfile "$ca")
+  start="$(date +%s%N 2>/dev/null || true)"
+  out="$(timeout 12 openssl s_client "${args[@]}" </dev/null 2>&1)" || rc=$?
+  end="$(date +%s%N 2>/dev/null || true)"
+  if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] && (( end > start )); then
+    ms=$(( (end - start) / 1000000 ))
+  fi
+  grep -qE 'Protocol[[:space:]]*:[[:space:]]*TLSv1\.3' <<<"$out" && tls=1
+  # TLS 1.3 下 s_client 不再打印 Server Temp Key；用 -groups X25519 强制只协商 X25519，
+  # 握手能拿到密码套件就说明对端支持 X25519。TLS 1.2 的输出里则直接看 Server Temp Key。
+  if grep -qE 'Server Temp Key[[:space:]]*:[[:space:]]*X25519' <<<"$out"; then
+    kx=1
+  elif [[ "$tls" == 1 ]] && grep -qE 'Cipher[[:space:]]+is[[:space:]]' <<<"$out"; then
+    kx=1
+  fi
+  grep -qE 'ALPN protocol[[:space:]]*:[[:space:]]*h2' <<<"$out" && h2=1
+  if grep -qE 'Verify return code[[:space:]]*:[[:space:]]*0' <<<"$out"; then
+    cert=1; certtxt="ok"
+    pem="$(sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' <<<"$out" | head -n 200)"
+    if [[ -n "$pem" ]] && printf '%s\n' "$pem" | openssl x509 -noout -checkend 2592000 >/dev/null 2>&1; then
+      certtxt="ok>30d"
+    elif [[ -n "$pem" ]] && printf '%s\n' "$pem" | openssl x509 -noout -checkend 604800 >/dev/null 2>&1; then
+      certtxt="ok<30d"
+    else
+      certtxt="ok临期"
+    fi
+  elif [[ "$out" == *"certificate has expired"* ]]; then
+    note="证书已过期"
+  elif [[ "$rc" != 0 && "$tls" == 0 ]]; then
+    note="握手失败"
+  fi
+  [[ "$tls" == 1 && "$h2" == 0 ]] && note="无 HTTP/2"
+  [[ "$tls" == 1 && "$kx" == 0 ]] && note="无 X25519"
+  if [[ "$tls" == 1 && "$kx" == 1 && "$h2" == 1 && "$cert" == 1 ]]; then
+    printf '%s\tPASS\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$ms" "$tls" "$kx" "$h2" "$certtxt" "$note"
+  else
+    printf '%s\tFAIL\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$ms" "$tls" "$kx" "$h2" "$certtxt" "$note"
+  fi
+}
+sni_scan() {
+  # 从标准输入读域名列表（每行一个），验证后按延迟排序；结果存入 SNI_ROWS，表格输出到 stdout
+  local -a list=() chunk=() rows=() passed=() failed=() sorted=()
+  local d f x line i=0 max dir cols
+  SNI_ROWS=(); SNI_BEST=""
+  max="$(optv parallel jobs)"; [[ "$max" =~ ^[0-9]+$ ]] && (( max >= 1 && max <= 32 )) || max=6
+  while IFS= read -r d; do
+    d="${d//$'\r'/}"
+    d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+    [[ -n "$d" ]] || continue
+    d="${d,,}"
+    [[ "$d" == *://* ]] && d="${d#*://}"
+    d="${d%%/*}"; d="${d%%\?*}"; d="${d%%#*}"; d="${d%.}"
+    valid_domain "$d" || { echo "  跳过无效域名：$d" >&2; continue; }
+    list+=("$d")
+  done
+  if (( ${#list[@]} == 0 )); then echo "没有可扫描的域名。" >&2; return 1; fi
+  dir="$(mktemp -d 2>/dev/null || mktemp -d /tmp/sni-scan.XXXXXX)"
+  echo "开始验证 ${#list[@]} 个域名（TLS 1.3 + X25519 + HTTP/2 + 证书），并发 $max：" >&2
+  for d in "${list[@]}"; do
+    chunk+=("$d")
+    if (( ${#chunk[@]} >= max )); then
+      for x in "${chunk[@]}"; do i=$((i + 1)); ( sni_probe "$x" >"$dir/$i.tsv" 2>/dev/null ) & done
+      wait || true
+      chunk=()
+    fi
+  done
+  if (( ${#chunk[@]} )); then
+    for x in "${chunk[@]}"; do i=$((i + 1)); ( sni_probe "$x" >"$dir/$i.tsv" 2>/dev/null ) & done
+    wait || true
+  fi
+  for f in "$dir"/*.tsv; do
+    [[ -s "$f" ]] || continue
+    rows+=("$(head -n 1 "$f")")
+  done
+  rm -rf "$dir"
+  if (( ${#rows[@]} == 0 )); then echo "没有拿到任何扫描结果。" >&2; return 1; fi
+  for line in "${rows[@]}"; do
+    if [[ "$(cut -f2 <<<"$line")" == PASS ]]; then passed+=("$line"); else failed+=("$line"); fi
+  done
+  if (( ${#passed[@]} )); then
+    while IFS= read -r line; do sorted+=("$line"); done < <(printf '%s\n' "${passed[@]}" | sort -t$'\t' -k3,3n)
+  fi
+  printf '%-32s %-6s %-8s %-6s %-6s %-4s %s\n' "域名" "结果" "延迟" "TLS13" "X25519" "H2" "证书"
+  local -a ordered=()
+  ordered=("${sorted[@]}" "${failed[@]}")
+  for line in "${ordered[@]}"; do
+    [[ -n "$line" ]] || continue
+    IFS=$'\t' read -r -a cols <<<"$line"
+    printf '%-32s %-6s %-8s %-6s %-6s %-4s %s%s\n' \
+      "${cols[0]}" "${cols[1]}" "${cols[2]}ms" \
+      "$( (( ${cols[3]:-0} )) && echo '✓' || echo '✗')" \
+      "$( (( ${cols[4]:-0} )) && echo '✓' || echo '✗')" \
+      "$( (( ${cols[5]:-0} )) && echo '✓' || echo '✗')" \
+      "${cols[6]:-}" "${cols[7]:+（${cols[7]}）}"
+    SNI_ROWS+=("$line")
+  done
+  if (( ${#sorted[@]} )); then
+    SNI_BEST="${sorted[0]%%$'\t'*}"
+    echo
+    echo "通过全部验证：${#sorted[@]} 个 / 共 ${#rows[@]} 个；最快：$SNI_BEST"
+  else
+    echo
+    echo "没有域名通过全部验证（共试了 ${#rows[@]} 个）。可换一个分类/地区，或用 --sni 手动指定。"
+  fi
+  return 0
+}
+sni_save_cache() {
+  have jq || return 0
+  [[ -d "$DATA" ]] || return 0
+  (( ${#SNI_ROWS[@]} )) || return 0
+  local tmp
+  tmp="$(mktemp "$DATA/.sni-scan.XXXXXX" 2>/dev/null)" || return 0
+  if printf '%s\n' "${SNI_ROWS[@]}" | jq -R -s --arg region "${SNI_REGION:-}" --arg at "$(date -Iseconds 2>/dev/null || date)" '
+      [split("\n")[] | select(length > 0) | split("\t")
+       | {domain: .[0], result: .[1], latency_ms: ((.[2] | tonumber?) // 0),
+          tls13: ((.[3] // "0") == "1"), x25519: ((.[4] // "0") == "1"), h2: ((.[5] // "0") == "1"),
+          cert: (.[6] // ""), note: (.[7] // "")}]
+      | {scanned_at: $at, region: $region, results: .}' >"$tmp" 2>/dev/null; then
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SNI_CACHE"
+  else
+    rm -f "$tmp"
+  fi
+}
+sni_collect() {
+  # 按 --file / --list / --category / --region 生成候选列表（每行一个域名），输出到 stdout
+  local cat file lst region
+  cat="$(optv category cat)"; file="$(optv file list-file)"; lst="$(optv list domains)"
+  if [[ -n "$file" ]]; then
+    [[ -r "$file" ]] || die "列表文件不可读：$file"
+    sed -E 's/[,;、， ]+/\n/g' "$file"
+  elif [[ -n "$lst" ]]; then
+    printf '%s\n' "$lst" | sed -E 's/[,;、， ]+/\n/g'
+  elif [[ -n "$cat" ]]; then
+    sni_cat "$cat" | tr ' ' '\n' || die "未知分类：$cat（可选：$(sni_categories)）"
+  else
+    region="$(optv region)"
+    [[ -n "$region" && "${region,,}" != auto ]] || region="$(sni_detect_region)"
+    SNI_REGION="${region^^}"
+    if [[ -n "$SNI_REGION" ]]; then
+      echo "本机出口地区：$SNI_REGION" >&2
+    else
+      echo "没能识别本机出口地区，改用通用候选列表。" >&2
+    fi
+    { sni_cat big-tech; sni_cat cdn; sni_cat dev; sni_region_extra "$SNI_REGION"; } | tr ' ' '\n'
+  fi
+}
+sni_need_openssl() {
+  have openssl || die "缺少 openssl，无法验证 TLS。先运行：$(self_cmd) install"
+  openssl s_client -help 2>&1 | grep -q -- '-groups' || die "当前 openssl 不支持 -groups，无法检查 X25519；请升级 openssl（OpenSSL 1.1.1 及以上）"
+}
+sni_run() {
+  # 先收集候选，再在当前 shell 里扫描（避免管道子 shell 丢掉 SNI_ROWS / SNI_BEST）
+  local cands
+  cands="$(sni_collect)" || return 1
+  if [[ -z "${cands//[[:space:]]/}" ]]; then echo "没有可扫描的域名。" >&2; return 1; fi
+  sni_scan <<<"$cands"
+}
+sni_select() {
+  # 从 SNI_ROWS 里选一个候选（回车用最快的）；结果输出到 stdout
+  local line d ans i=0
+  local -a pass=()
+  for line in "${SNI_ROWS[@]+"${SNI_ROWS[@]}"}"; do
+    [[ "$(cut -f2 <<<"$line")" == PASS ]] && pass+=("$line")
+  done
+  if (( ${#pass[@]} == 0 )); then
+    prompt d "手动输入 Reality SNI（直接回车用 www.bing.com）" "www.bing.com"
+    printf '%s' "$d"; return 0
+  fi
+  echo
+  for line in "${pass[@]}"; do
+    i=$((i + 1))
+    printf '  %d) %-32s %sms\n' "$i" "${line%%$'\t'*}" "$(cut -f3 <<<"$line")"
+  done
+  read -r -p "选择序号（回车用 1，也可直接输入域名）: " ans || ans=""
+  ans="${ans//[[:space:]]/}"
+  if [[ -z "$ans" ]]; then
+    d="${pass[0]%%$'\t'*}"
+  elif [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= ${#pass[@]} )); then
+    d="${pass[$((10#$ans - 1))]%%$'\t'*}"
+  elif valid_domain "$ans"; then
+    d="$ans"
+  else
+    d="${pass[0]%%$'\t'*}"
+    echo "编号无效，使用最快的 $d" >&2
+  fi
+  printf '%s' "$d"
+}
+sni_interactive() {
+  # 添加 Reality 时选择 SNI：手动输入，或按地区 / 分类 / 自定义列表扫描后挑一个
+  local c cat l
+  echo "Reality SNI / 握手域名（伪装目标，需要支持 TLS 1.3 + X25519 + HTTP/2 的有效证书）："
+  echo "1) 手动输入（默认 www.bing.com）"
+  echo "2) 按本机出口地区自动扫描"
+  echo "3) 按分类扫描（big-tech / cdn / dev / media / ecom）"
+  echo "4) 自定义域名列表扫描（逗号分隔或文件路径）"
+  read -r -p "选择 [1-4，默认 1]: " c || c=1
+  case "${c:-1}" in
+    1) local d; prompt d "Reality SNI/握手域名" "www.bing.com"; printf '%s' "$d"; return 0 ;;
+    3)
+      echo "分类：1) big-tech 2) cdn 3) dev 4) media 5) ecom 6) all"
+      read -r -p "选择 [1-6，默认 1]: " cat || cat=1
+      case "${cat:-1}" in
+        1) cat=big-tech ;; 2) cat=cdn ;; 3) cat=dev ;; 4) cat=media ;; 5) cat=ecom ;; *) cat=all ;;
+      esac
+      OPTS[category]="$cat" ;;
+    4)
+      prompt l "域名列表（逗号或空格分隔，也可以输入文件路径）" ""
+      if [[ -f "$l" ]]; then OPTS[file]="$l"; else OPTS[list]="$l"; fi ;;
+  esac
+  sni_need_openssl
+  sni_run
+  sni_save_cache
+  sni_select
+}
+sni_auto_pick() {
+  # 非交互：扫描后自动返回最快的可用域名；表格输出到 stderr，便于调用方取返回值
+  local best
+  sni_need_openssl
+  sni_run >&2 || true
+  sni_save_cache
+  best="$SNI_BEST"
+  if [[ -z "$best" ]]; then
+    die "SNI 扫描没有找到通过 TLS 1.3 / X25519 / HTTP/2 / 证书 验证的域名，请用 --sni 手动指定"
+  fi
+  echo "已自动选择 SNI：$best" >&2
+  printf '%s' "$best"
+}
+cmd_scan_sni() {
+  sni_need_openssl
+  sni_run
+  sni_save_cache
+  if opt_bool auto; then
+    [[ -n "$SNI_BEST" ]] || exit 1
+    printf '%s\n' "$SNI_BEST"
+  fi
+  if opt_bool json; then
+    [[ -f "$SNI_CACHE" ]] && { echo "（完整结果已保存到 $SNI_CACHE）"; }
+  fi
+}
+
 # ---------- 添加节点 ----------
 add_reality() {
   local tag port sni uuid keys priv pub sid obj host fps
   echo "本项会在本机创建 VLESS + Reality + Vision 服务端入站；本机地址、UUID、Reality 密钥和 short_id 用于新建节点，不会复用示例链接里的远端服务器凭据。"
   echo "客户端 URI 参数 packetEncoding=xudp 属于出站侧设置，不是本机入站字段；sing-box 客户端默认使用 xudp。"
   ask_tag tag reality
-  prompt port "TCP 端口" "$(free_port 443 tcp)"
-  check_port "$port" tcp
-  prompt sni "Reality SNI/握手域名" "www.bing.com"
+  ask_port port "TCP 端口" "$(free_port 443 tcp)" tcp
+  sni="$(optv sni)"
+  if [[ -z "$sni" ]]; then
+    if (( NONINT )); then sni="www.bing.com"; else sni="$(sni_interactive)"; fi
+  elif [[ "$sni" == auto || "$sni" == scan ]]; then
+    sni="$(sni_auto_pick)"
+  fi
+  [[ -n "$sni" ]] || die "Reality SNI 不能为空"
+  valid_domain "$sni" || die "Reality SNI 必须是域名（不要带 https:// 或路径）：$sni"
   choose_fps fps chrome reality
   host="$(public_host)"
   uuid="$(new_uuid)"
@@ -1683,14 +2182,13 @@ add_reality() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg uuid "$uuid" --arg host "$host" --argjson port "$port" --arg sni "$sni" --arg pub "$pub" --arg sid "$sid" --argjson fps "$(fps_json "$fps")" \
     '{protocol:"VLESS + Reality",tag:$tag,server:$host,port:$port,uuid:$uuid,flow:"xtls-rprx-vision",security:"reality",sni:$sni,public_key:$pub,short_id:$sid,fps:$fps}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
 }
 add_vmess() {
   local tag port uuid obj host
   echo "本项会创建标准 VMess AEAD（alterId=0）TCP 入站，不启用 TLS；服务器地址和 UUID 会生成 VMess 分享链接。"
   ask_tag tag vmess
-  prompt port "TCP 端口" "$(free_port 10086 tcp)"
-  check_port "$port" tcp
-  port="$((10#$port))"
+  ask_port port "TCP 端口" "$(free_port 10086 tcp)" tcp
   host="$(public_host)"
   uuid="$(new_uuid)"
   obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" \
@@ -1698,57 +2196,60 @@ add_vmess() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg uuid "$uuid" \
     '{protocol:"VMess",tag:$tag,server:$host,port:$port,uuid:$uuid,alter_id:0,security:"auto",network:"tcp"}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
 }
 add_hy2() {
   local tag port password obj host
   ask_tag tag hy2
-  prompt port "UDP 端口" "$(free_port 8443 udp)"
-  check_port "$port" udp
+  ask_port port "UDP 端口" "$(free_port 8443 udp)" udp
   host="$(public_host)"
-  ask_tls_host "$host"
+  setup_tls "$tag"
   password="$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-32)"
-  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg password "$password" \
-    '{type:"hysteria2",tag:$tag,listen:"::",listen_port:$port,users:[{password:$password}],tls:{enabled:true,certificate_path:"/etc/sing-box/certs/server.crt",key_path:"/etc/sing-box/certs/server.key"}}')"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg password "$password" --arg cert "$TLS_CERT" --arg key "$TLS_KEY" \
+    '{type:"hysteria2",tag:$tag,listen:"::",listen_port:$port,users:[{password:$password}],tls:{enabled:true,certificate_path:$cert,key_path:$key}}')"
   apply_json "$obj"
-  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" \
-    '{protocol:"Hysteria2",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:true}')"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" --argjson ins "$TLS_INS" \
+    '{protocol:"Hysteria2",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:$ins}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 UDP $port。"
 }
 add_tuic() {
   local tag port uuid password obj host
   ask_tag tag tuic
-  prompt port "UDP 端口" "$(free_port 9443 udp)"
-  check_port "$port" udp
+  ask_port port "UDP 端口" "$(free_port 9443 udp)" udp
   host="$(public_host)"
-  ask_tls_host "$host"
+  setup_tls "$tag"
   uuid="$(new_uuid)"
   password="$(openssl rand -hex 24)"
-  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg password "$password" \
-    '{type:"tuic",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$password}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/server.crt",key_path:"/etc/sing-box/certs/server.key"}}')"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg password "$password" --arg cert "$TLS_CERT" --arg key "$TLS_KEY" \
+    '{type:"tuic",tag:$tag,listen:"::",listen_port:$port,users:[{uuid:$uuid,password:$password}],congestion_control:"bbr",tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}}')"
   apply_json "$obj"
-  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg uuid "$uuid" --arg password "$password" --arg sni "$TLS_HOST" \
-    '{protocol:"TUIC",tag:$tag,server:$host,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:true}')"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg uuid "$uuid" --arg password "$password" --arg sni "$TLS_HOST" --argjson ins "$TLS_INS" \
+    '{protocol:"TUIC",tag:$tag,server:$host,port:$port,uuid:$uuid,password:$password,sni:$sni,insecure:$ins}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 UDP $port。"
 }
 add_anytls() {
   local tag port password obj host fps
   ask_tag tag anytls
-  prompt port "TCP 端口" "$(free_port 10443 tcp)"
-  check_port "$port" tcp
+  ask_port port "TCP 端口" "$(free_port 10443 tcp)" tcp
   host="$(public_host)"
-  ask_tls_host "$host"
+  setup_tls "$tag"
   choose_fps fps chrome
   password="$(openssl rand -hex 24)"
-  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg password "$password" \
-    '{type:"anytls",tag:$tag,listen:"::",listen_port:$port,users:[{name:"user",password:$password}],tls:{enabled:true,certificate_path:"/etc/sing-box/certs/server.crt",key_path:"/etc/sing-box/certs/server.key"}}')"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg password "$password" --arg cert "$TLS_CERT" --arg key "$TLS_KEY" \
+    '{type:"anytls",tag:$tag,listen:"::",listen_port:$port,users:[{name:"user",password:$password}],tls:{enabled:true,certificate_path:$cert,key_path:$key}}')"
   apply_json "$obj"
-  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" --argjson fps "$(fps_json "$fps")" \
-    '{protocol:"AnyTLS",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:true,fps:$fps}')"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg password "$password" --arg sni "$TLS_HOST" --argjson ins "$TLS_INS" --argjson fps "$(fps_json "$fps")" \
+    '{protocol:"AnyTLS",tag:$tag,server:$host,port:$port,password:$password,sni:$sni,insecure:$ins,fps:$fps}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
 }
 add_ss() {
   local tag port password method obj host
   ask_tag tag ss
-  prompt port "TCP 端口" "$(free_port 11443 tcp)"
-  check_port "$port" tcp
-  prompt method "加密方式" "aes-128-gcm"
+  ask_port port "TCP 端口" "$(free_port 11443 tcp)" tcp
+  method="$(optv method)"
+  if [[ -z "$method" ]]; then
+    if (( NONINT )); then method="aes-128-gcm"; else prompt method "加密方式" "aes-128-gcm"; fi
+  fi
   case "$method" in aes-128-gcm|aes-256-gcm|chacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm) ;; *) die "暂不接受该加密方式；请使用 aes-128-gcm、aes-256-gcm、chacha20-ietf-poly1305 或对应的 2022-blake3 方法" ;; esac
   host="$(public_host)"
   case "$method" in
@@ -1761,6 +2262,889 @@ add_ss() {
   apply_json "$obj"
   save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg method "$method" --arg password "$password" \
     '{protocol:"Shadowsocks",tag:$tag,server:$host,port:$port,method:$method,password:$password}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
+}
+add_trojan() {
+  local tag port password obj host
+  echo "本项创建 Trojan 入站（TLS + 密码，TCP）；默认给每个节点生成独立的自签证书。"
+  ask_tag tag trojan
+  ask_port port "TCP 端口" "$(free_port 20443 tcp)" tcp
+  host="$(public_host)"
+  setup_tls "$tag"
+  password="$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-32)"
+  obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg pw "$password" --arg cert "$TLS_CERT" --arg key "$TLS_KEY" \
+    '{type:"trojan",tag:$tag,listen:"::",listen_port:$port,users:[{name:"user",password:$pw}],tls:{enabled:true,certificate_path:$cert,key_path:$key}}')"
+  apply_json "$obj"
+  save_node "$tag" "$(jq -n --arg tag "$tag" --arg host "$host" --argjson port "$port" --arg pw "$password" --arg sni "$TLS_HOST" --argjson ins "$TLS_INS" \
+    '{protocol:"Trojan",tag:$tag,server:$host,port:$port,password:$pw,sni:$sni,insecure:$ins}')"
+  echo "防火墙：请在系统防火墙和云安全组放行 TCP $port。"
+}
+
+# ---------- Argo（Cloudflare Tunnel / cloudflared） ----------
+argo_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7*|armhf|armv6*|armel) echo arm ;;
+    i386|i486|i586|i686|x86) echo 386 ;;
+    *) return 1 ;;
+  esac
+}
+argo_names() {
+  # 由节点名生成服务名和日志/Token 路径，结果写入全局变量
+  ARGO_SERVICE="cloudflared-$1"
+  ARGO_UNIT="/etc/systemd/system/${ARGO_SERVICE}.service"
+  ARGO_INIT="/etc/init.d/${ARGO_SERVICE}"
+  ARGO_LOG_FILE="/var/log/${ARGO_SERVICE}.log"
+  ARGO_TOKEN_FILE="$ARGO_DIR/$1.token"
+}
+argo_install_core() {
+  local arch url tmp
+  if [[ -x "$ARGO_BIN" ]]; then
+    "$ARGO_BIN" --version >/dev/null 2>&1 || die "$ARGO_BIN 已存在但无法运行；为保护现有文件未覆盖"
+    echo "已检测到 cloudflared：$ARGO_BIN（$("$ARGO_BIN" --version 2>/dev/null | head -n1)）"
+    return 0
+  fi
+  [[ ! -e "$ARGO_BIN" ]] || die "$ARGO_BIN 已存在但不是可执行文件；为保护现有文件未继续"
+  arch="$(argo_arch)" || die "Cloudflare Tunnel 官方程序暂不支持此架构：$(uname -m)"
+  url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
+  tmp="$(mktemp)"
+  echo "正在下载 cloudflared（linux-${arch}）……"
+  if ! curl -fL --retry 2 --connect-timeout 15 --max-time 300 "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    die "下载 cloudflared 失败：$url"
+  fi
+  chmod 700 "$tmp"
+  if ! "$tmp" --version >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "下载的 cloudflared 无法在本机运行"
+  fi
+  install -m 755 "$tmp" "$ARGO_BIN"
+  rm -f "$tmp"
+  echo "已安装 $ARGO_BIN（$("$ARGO_BIN" --version | head -n1)）"
+}
+argo_write_service() {
+  # $1 节点名；$2 quick / token；$3 本地端口
+  local tag="$1" mode="$2" port="$3" args
+  argo_names "$tag"
+  if [[ "$mode" == token ]]; then
+    args="tunnel --no-autoupdate --logfile ${ARGO_LOG_FILE} run --token-file ${ARGO_TOKEN_FILE}"
+  else
+    args="tunnel --no-autoupdate --logfile ${ARGO_LOG_FILE} --url http://127.0.0.1:${port}"
+  fi
+  if [[ "$INIT_SYS" == systemd ]]; then
+    if [[ -e "$ARGO_UNIT" ]] && ! grep -qxF "$ARGO_MARK" "$ARGO_UNIT" 2>/dev/null; then
+      die "$ARGO_UNIT 已存在且不属于本脚本；为保护现有服务未覆盖"
+    fi
+    cat >"$ARGO_UNIT" <<UNIT
+[Unit]
+Description=Cloudflare Tunnel for sing-box manager node ${tag}
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${ARGO_BIN} ${args}
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+${ARGO_MARK}
+UNIT
+    chmod 644 "$ARGO_UNIT"
+    touch "$ARGO_LOG_FILE" 2>/dev/null || true
+    chmod 600 "$ARGO_LOG_FILE" 2>/dev/null || true
+    systemctl daemon-reload
+  elif is_openrc; then
+    if [[ -e "$ARGO_INIT" ]] && ! grep -qxF "$ARGO_MARK" "$ARGO_INIT" 2>/dev/null; then
+      die "$ARGO_INIT 已存在且不属于本脚本；为保护现有服务未覆盖"
+    fi
+    cat >"$ARGO_INIT" <<RC
+#!/sbin/openrc-run
+${ARGO_MARK}
+name="${ARGO_SERVICE}"
+description="Cloudflare Tunnel for sing-box manager node ${tag}"
+supervisor="supervise-daemon"
+command="${ARGO_BIN}"
+command_args="${args}"
+respawn_delay=5
+respawn_max=0
+RC
+    chmod 755 "$ARGO_INIT"
+    touch "$ARGO_LOG_FILE" 2>/dev/null || true
+    chmod 600 "$ARGO_LOG_FILE" 2>/dev/null || true
+  else
+    die "没有找到 systemd 或 OpenRC，无法把 Argo 隧道安装成服务"
+  fi
+}
+argo_active() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    [[ "$(systemctl is-active "$ARGO_SERVICE" 2>/dev/null)" == active ]]
+  else
+    rc-service "$ARGO_SERVICE" status >/dev/null 2>&1
+  fi
+}
+argo_active_wait() {
+  local i
+  for ((i = 0; i < 20; i++)); do
+    argo_active && return 0
+    sleep 0.5
+  done
+  return 1
+}
+argo_start() {
+  local tag="$1"
+  argo_names "$tag"
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl reset-failed "$ARGO_SERVICE" >/dev/null 2>&1 || true
+    systemctl enable "$ARGO_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$ARGO_SERVICE"
+  else
+    rc-update add "$ARGO_SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$ARGO_SERVICE" restart >/dev/null 2>&1 || rc-service "$ARGO_SERVICE" start
+  fi
+}
+argo_wait_host() {
+  # 快速隧道：从 cloudflared 日志里读 trycloudflare 域名（最长约 60 秒）；$2 可指定日志路径
+  local tag="$1" i host log
+  argo_names "$tag"
+  log="${2:-$ARGO_LOG_FILE}"
+  for ((i = 0; i < 60; i++)); do
+    host="$(grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' "$log" 2>/dev/null | head -n1)"
+    if [[ -n "$host" ]]; then printf '%s' "${host#https://}"; return 0; fi
+    sleep 1
+  done
+  return 1
+}
+argo_remove_service() {
+  local tag="$1"
+  argo_names "$tag"
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl disable --now "$ARGO_SERVICE" >/dev/null 2>&1 || true
+    if [[ -f "$ARGO_UNIT" ]] && grep -qxF "$ARGO_MARK" "$ARGO_UNIT" 2>/dev/null; then rm -f "$ARGO_UNIT"; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  else
+    rc-service "$ARGO_SERVICE" stop >/dev/null 2>&1 || true
+    rc-update del "$ARGO_SERVICE" default >/dev/null 2>&1 || true
+    if [[ -f "$ARGO_INIT" ]] && grep -qxF "$ARGO_MARK" "$ARGO_INIT" 2>/dev/null; then rm -f "$ARGO_INIT"; fi
+  fi
+  rm -f "$ARGO_TOKEN_FILE" "$ARGO_LOG_FILE"
+}
+argo_meta_set_host() {
+  local tag="$1" host="$2" f="$ARGO_DIR/$1.json"
+  jq --arg h "$host" '.host = $h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"
+  rm -f "$f.tmp"
+}
+add_argo() {
+  local tag proto port path uuid host="" mode token domain choice obj label had_inbound=0
+  need_jq
+  argo_install_core
+  ask_tag tag argo
+  proto="$(optv proto protocol)"; proto="${proto:-vmess}"; proto="${proto,,}"
+  case "$proto" in vmess|vless) ;; *) die "--proto 只能是 vmess 或 vless" ;; esac
+  ask_port port "本机 WebSocket 端口（只监听 127.0.0.1）" "$(free_port 18080 tcp)" tcp
+  path="$(optv path)"; [[ -n "$path" ]] || path="/argo-$(random_hex 6)"
+  xray_valid_path "$path" || die "WebSocket 路径必须以 / 开头且不能包含空白字符"
+  token="$(optv token)"
+  domain="$(optv domain hostname tunnel-host)"
+  if [[ -n "$token" ]]; then
+    mode=token
+    if [[ -z "$domain" ]]; then
+      (( NONINT )) && die "命名隧道需要同时用 --domain 指定 Cloudflare 里已映射到本机端口的域名"
+      prompt domain "命名隧道的公网域名（Cloudflare 后台已映射到本机端口）" ""
+    fi
+  elif opt_bool quick || (( NONINT )); then
+    mode=quick
+  else
+    echo "隧道方式："
+    echo "1) 快速隧道（trycloudflare.com 临时域名，无需 Cloudflare 账号；域名会随重启变化）"
+    echo "2) 命名隧道（Cloudflare 账号里的 Tunnel Token + 已映射的域名，适合长期使用）"
+    read -r -p "选择 [1-2，默认 1]: " choice || choice=1
+    if [[ "${choice:-1}" == 2 ]]; then
+      mode=token
+      prompt token "Tunnel Token（Cloudflare Zero Trust → Networks → Tunnels 里复制）" ""
+      [[ -n "$token" ]] || die "Token 不能为空"
+      prompt domain "命名隧道的公网域名（已映射到本机 127.0.0.1:$port）" ""
+    fi
+  fi
+  if [[ "$mode" == token ]]; then
+    valid_domain "$domain" || die "Argo 域名无效：$domain"
+    echo "提醒：请在 Cloudflare 的隧道配置里把这个域名的 Public Hostname 指向 http://127.0.0.1:$port（路径 $path）。"
+    host="$domain"
+  fi
+  uuid="$(new_uuid)"
+  if [[ "$proto" == vmess ]]; then
+    obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
+      '{type:"vmess",tag:$tag,listen:"127.0.0.1",listen_port:$port,users:[{name:$tag,uuid:$uuid,alterId:0}],transport:{type:"ws",path:$path}}')"
+    label="VMess + WS (Argo)"
+  else
+    obj="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg path "$path" \
+      '{type:"vless",tag:$tag,listen:"127.0.0.1",listen_port:$port,users:[{name:$tag,uuid:$uuid}],transport:{type:"ws",path:$path}}')"
+    label="VLESS + WS (Argo)"
+  fi
+  mkdir -p "$ARGO_DIR"
+  argo_names "$tag"
+  [[ ! -e "$ARGO_DIR/$tag.json" ]] || die "已经有一个叫 $tag 的 Argo 节点"
+  apply_json "$obj"
+  had_inbound=1
+  if [[ "$mode" == token ]]; then
+    printf '%s\n' "$token" >"$ARGO_TOKEN_FILE"
+    chmod 600 "$ARGO_TOKEN_FILE"
+  fi
+  jq -n --arg tag "$tag" --arg proto "$proto" --argjson port "$port" --arg path "$path" --arg mode "$mode" --arg host "${domain:-}" \
+    '{tag:$tag,proto:$proto,local_port:$port,path:$path,mode:$mode,host:$host}' >"$ARGO_DIR/$tag.json"
+  chmod 600 "$ARGO_DIR/$tag.json"
+  argo_write_service "$tag" "$mode" "$port"
+  if ! argo_start "$tag" || ! argo_active_wait; then
+    argo_remove_service "$tag"
+    rm -f "$ARGO_DIR/$tag.json" "$DATA/$tag.json"
+    if (( had_inbound )) && jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONF" >/dev/null 2>&1; then
+      ( remove_by_tag "$tag" >/dev/null 2>&1 ) || true
+    fi
+    die "cloudflared 服务没能启动；已回滚本次添加的 Argo 节点。查看日志：tail -n 50 ${ARGO_LOG_FILE}"
+  fi
+  if [[ "$mode" == quick ]]; then
+    echo "等待 Cloudflare 分配临时域名（最长约 60 秒）……"
+    if ! host="$(argo_wait_host "$tag")"; then
+      argo_remove_service "$tag"
+      rm -f "$ARGO_DIR/$tag.json" "$DATA/$tag.json"
+      if jq -e --arg t "$tag" '[.inbounds[]? | select(.tag == $t)] | length > 0' "$CONF" >/dev/null 2>&1; then
+        ( remove_by_tag "$tag" >/dev/null 2>&1 ) || true
+      fi
+      die "没有从 cloudflared 日志里读到 trycloudflare 域名；已回滚。日志：tail -n 50 ${ARGO_LOG_FILE}"
+    fi
+    argo_meta_set_host "$tag" "$host"
+  fi
+  save_node "$tag" "$(jq -n --arg proto "$label" --arg tag "$tag" --arg host "$host" --arg path "$path" --arg uuid "$uuid" --arg mode "$mode" \
+    '{protocol:$proto,tag:$tag,server:$host,port:443,ws_host:$host,path:$path,uuid:$uuid,tls:"tls",insecure:false,argo_mode:$mode}')"
+  echo "Argo 节点已添加：$tag（$label，$mode）→ https://$host$path → 本机 127.0.0.1:$port"
+  if [[ "$mode" == quick ]]; then
+    echo "注意：快速隧道的域名不保证可用性，cloudflared 重启后会变。变了以后运行：$(self_cmd) argo url $tag"
+  fi
+  if [[ "$INIT_SYS" == systemd ]]; then
+    echo "服务名：${ARGO_SERVICE}（systemctl status ${ARGO_SERVICE}）"
+  else
+    echo "服务名：${ARGO_SERVICE}（rc-service ${ARGO_SERVICE} status）"
+  fi
+}
+argo_list() {
+  local f any=0
+  shopt -s nullglob
+  local files=("$ARGO_DIR"/*.json)
+  shopt -u nullglob
+  ((${#files[@]})) || { echo "还没有 Argo 节点。"; return 0; }
+  for f in "${files[@]}"; do
+    any=1
+    echo "===== $(jq -r .tag "$f") ====="
+    echo "方式：$(jq -r .mode "$f")　域名：$(jq -r .host "$f")　本机端口：$(jq -r .local_port "$f")　路径：$(jq -r .path "$f")"
+    if [[ -f "$DATA/$(jq -r .tag "$f").json" ]]; then print_link "$DATA/$(jq -r .tag "$f").json"; fi
+    echo
+  done
+  ((any)) || true
+}
+argo_refresh() {
+  local tag="${1:-}" host f
+  if [[ -z "$tag" ]]; then argo_list; prompt tag "要刷新域名的 Argo 节点名称" ""; fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  f="$ARGO_DIR/$tag.json"
+  [[ -f "$f" ]] || die "没有名为 $tag 的 Argo 节点"
+  if [[ "$(jq -r .mode "$f")" != quick ]]; then
+    echo "$tag 是命名隧道，域名固定为 $(jq -r .host "$f")，不用刷新。"
+    return 0
+  fi
+  argo_start "$tag" >/dev/null 2>&1 || true
+  if ! host="$(argo_wait_host "$tag")"; then
+    argo_names "$tag"
+    die "没有从日志里读到新的 trycloudflare 域名；查看：tail -n 50 ${ARGO_LOG_FILE}"
+  fi
+  argo_meta_set_host "$tag" "$host"
+  if [[ -f "$DATA/$tag.json" ]]; then
+    jq --arg h "$host" '.server = $h | .ws_host = $h' "$DATA/$tag.json" >"$DATA/$tag.json.tmp" && install -m 600 "$DATA/$tag.json.tmp" "$DATA/$tag.json"
+    rm -f "$DATA/$tag.json.tmp"
+  fi
+  echo "新的 Argo 域名：$host"
+  if [[ -f "$DATA/$tag.json" ]]; then print_link "$DATA/$tag.json"; fi
+}
+argo_log() {
+  local tag="${1:-}" n="${2:-100}"
+  if [[ -z "$tag" ]]; then argo_list; prompt tag "Argo 节点名称" ""; fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  argo_names "$tag"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=100
+  if [[ -s "$ARGO_LOG_FILE" ]]; then tail -n "$n" "$ARGO_LOG_FILE"; else echo "暂无日志（$ARGO_LOG_FILE）"; fi
+}
+argo_remove() {
+  local tag="${1:-}"
+  if [[ -z "$tag" ]]; then argo_list; prompt tag "要删除的 Argo 节点名称" ""; fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  [[ -f "$ARGO_DIR/$tag.json" ]] || die "没有名为 $tag 的 Argo 节点"
+  remove_by_tag "$tag"
+}
+cmd_argo() {
+  case "${1:-add}" in
+    add|node) prepare_manage; add_argo ;;
+    list|ls) argo_list ;;
+    url|refresh) argo_refresh "${2:-}" ;;
+    log|logs) argo_log "${2:-}" "${3:-100}" ;;
+    remove|del|rm) prepare_manage; argo_remove "${2:-}" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+# ---------- Telegram 机器人 ----------
+tg_conf_path() { printf '%s' "$DATA/tgbot.conf"; }
+tg_valid_token() { [[ "$1" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]]; }
+tg_valid_chat() { [[ "$1" =~ ^-?[0-9]+$ ]] || [[ "$1" =~ ^@[A-Za-z0-9_]{4,}$ ]]; }
+tg_load() {
+  # 只读取本脚本写入的三个键，不 source 配置文件
+  local f k v
+  TG_BOT_TOKEN=""; TG_CHAT_ID=""; TG_AUTO_PUSH=0
+  f="$(tg_conf_path)"
+  [[ -f "$f" && -r "$f" ]] || return 1
+  while IFS='=' read -r k v || [[ -n "${k:-}" ]]; do
+    case "${k:-}" in
+      TG_BOT_TOKEN) TG_BOT_TOKEN="${v:-}" ;;
+      TG_CHAT_ID) TG_CHAT_ID="${v:-}" ;;
+      TG_AUTO_PUSH) TG_AUTO_PUSH="${v:-0}" ;;
+    esac
+  done <"$f"
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]]
+}
+tg_conf_write() {
+  local f tmp
+  mkdir -p "$DATA"
+  f="$(tg_conf_path)"
+  tmp="$(mktemp "$DATA/.tgbot.conf.XXXXXX")" || die "无法写入 Telegram 机器人配置"
+  printf 'TG_BOT_TOKEN=%s\nTG_CHAT_ID=%s\nTG_AUTO_PUSH=%s\n' "$TG_BOT_TOKEN" "$TG_CHAT_ID" "${TG_AUTO_PUSH:-0}" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$f"
+}
+tg_api_json() {
+  # $1 方法名；$2 JSON body（可空）；$3 超时秒数。Token 和内容都放在 600 权限的 curl 配置里，不出现在进程参数里
+  local method="$1" body="${2:-}" tout="${3:-40}" cfg bf out rc=0
+  [[ -n "$TG_BOT_TOKEN" ]] || die "还没有配置 Telegram Bot Token（运行 $(self_cmd) tg config）"
+  cfg="$(mktemp)" || die "无法创建临时文件"
+  chmod 600 "$cfg"
+  printf 'url = "%s/bot%s/%s"\n' "$TG_API" "$TG_BOT_TOKEN" "$method" >"$cfg"
+  if [[ -n "$body" ]]; then
+    bf="$(mktemp)" || die "无法创建临时文件"
+    chmod 600 "$bf"
+    printf '%s' "$body" >"$bf"
+    printf 'header = "Content-Type: application/json"\ndata-binary = "@%s"\n' "$bf" >>"$cfg"
+  fi
+  out="$(curl -sS --max-time "$tout" --config "$cfg" 2>&1)" || rc=$?
+  rm -f "$cfg"
+  [[ -z "${bf:-}" ]] || rm -f "$bf"
+  if (( rc != 0 )); then
+    printf '{"ok":false,"error":"curl %s: %s"}' "$rc" "${out//\"/\'}"
+    return 1
+  fi
+  printf '%s' "$out"
+}
+tg_send_document() {
+  # $1 chat；$2 内容；$3 文件名
+  local chat="$1" content="$2" name="${3:-singbox-nodes.txt}" f cfg rc=0
+  [[ -n "$TG_BOT_TOKEN" ]] || return 1
+  f="$(mktemp)" || return 1
+  chmod 600 "$f"
+  printf '%s\n' "$content" >"$f"
+  cfg="$(mktemp)" || { rm -f "$f"; return 1; }
+  chmod 600 "$cfg"
+  printf 'url = "%s/bot%s/sendDocument"\n' "$TG_API" "$TG_BOT_TOKEN" >"$cfg"
+  curl -fsS --max-time 90 --config "$cfg" \
+    -F "chat_id=${chat}" -F "document=@${f};filename=${name}" \
+    -F "caption=singbox-manager 节点信息" >/dev/null 2>&1 || rc=$?
+  rm -f "$f" "$cfg"
+  (( rc == 0 )) || { echo "Telegram 文件发送失败" >&2; return 1; }
+}
+tg_send_message() {
+  # $1 chat；$2 文本。超过 3800 字符分段，超过 12000 字符改发 txt 文件
+  local chat="$1" text="$2" max=3800 rest piece resp
+  [[ -n "$text" ]] || return 0
+  if (( ${#text} > 12000 )); then tg_send_document "$chat" "$text"; return $?; fi
+  rest="$text"
+  while [[ -n "$rest" ]]; do
+    piece="${rest:0:max}"
+    rest="${rest:max}"
+    resp="$(tg_api_json sendMessage "$(jq -n --arg c "$chat" --arg t "$piece" '{chat_id:(($c|tonumber?) // $c), text:$t, disable_web_page_preview:true}')" 20 || true)"
+    if ! jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1; then
+      echo "Telegram 发送失败：${resp:0:200}" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+tg_authorized() {
+  local chat="$1" x
+  local -a list=()
+  IFS=',' read -r -a list <<<"$TG_CHAT_ID"
+  for x in "${list[@]}"; do
+    x="${x//[[:space:]]/}"
+    [[ -n "$x" && "$x" == "$chat" ]] && return 0
+  done
+  return 1
+}
+tg_collect_links() {
+  # $1 可选节点名；输出全部或该节点的分享链接
+  local tag="${1:-}" f out found=0
+  local -a files=()
+  if [[ -n "$tag" ]]; then
+    valid_tag "$tag"
+    if [[ -f "$XRAY_DATA/$tag.json" ]]; then f="$XRAY_DATA/$tag.json"
+    elif [[ -f "$DATA/$tag.json" ]]; then f="$DATA/$tag.json"
+    else die "没有名为 $tag 的节点"; fi
+    print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss|trojan)://' || true
+    return 0
+  fi
+  shopt -s nullglob
+  files=("$DATA"/*.json "$XRAY_DATA"/*.json)
+  shopt -u nullglob
+  (( ${#files[@]} )) || { echo "还没有节点。"; return 0; }
+  for f in "${files[@]}"; do
+    out="$(print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss|trojan)://' || true)"
+    [[ -n "$out" ]] || continue
+    found=1
+    printf '===== %s =====\n%s\n' "$(jq -r '.tag' "$f")" "$out"
+  done
+  (( found )) || echo "还没有可推送的分享链接。"
+  return 0
+}
+tg_maybe_autopush() {
+  # 新节点创建后，按配置自动推送该节点链接（失败不影响节点添加）；--tg-push 可临时强制推送一次
+  local tag="$1" content force=0
+  [[ -z "${TG_SUPPRESS_AUTOPUSH:-}" ]] || return 0
+  opt_bool tg-push && force=1
+  if ! tg_load >/dev/null 2>&1; then
+    (( force )) && echo "提示：--tg-push 需要先配置机器人（$(self_cmd) tg config）。" >&2
+    return 0
+  fi
+  [[ "${TG_AUTO_PUSH:-0}" == 1 || "$force" == 1 ]] || return 0
+  content="$(tg_collect_links "$tag" 2>/dev/null || true)"
+  [[ -n "${content//[[:space:]]/}" ]] || return 0
+  if tg_send_message "$TG_CHAT_ID" "新节点：$tag
+$content" >/dev/null 2>&1; then
+    echo "已把 $tag 的分享链接推送到了 Telegram。"
+  else
+    echo "提示：推送失败，可用 $(self_cmd) tg test 检查配置。" >&2
+  fi
+  return 0
+}
+tg_push() {
+  local tag="${1:-}" content
+  need_jq
+  tg_load || die "还没有配置 Telegram 机器人（运行 $(self_cmd) tg config --token ... --chat-id ...）"
+  content="$(tg_collect_links "$tag")" || exit 1
+  [[ -n "${content//[[:space:]]/}" ]] || die "没有可推送的分享链接"
+  tg_send_message "$TG_CHAT_ID" "【$(hostname 2>/dev/null || echo sing-box)】节点分享链接
+$content" || die "推送失败：请确认 chat_id 正确，且已先给机器人发过 /start"
+  echo "已推送到 Telegram（chat_id=$TG_CHAT_ID）。"
+}
+tg_test() {
+  local me
+  if [[ -n "$(optv token)$(optv chat-id tg-chat chat)" ]]; then tg_config; fi
+  tg_load || die "还没有配置 Telegram 机器人（运行 $(self_cmd) tg config）"
+  me="$(tg_api_json getMe "" 20 || true)"
+  if ! jq -e '.ok == true' <<<"$me" >/dev/null 2>&1; then
+    die "Token 无效或网络不通：${me:0:200}"
+  fi
+  echo "机器人：@$(jq -r '.result.username // "?"' <<<"$me")（$(jq -r '.result.first_name // "?"' <<<"$me")）"
+  tg_send_message "$TG_CHAT_ID" "singbox-manager 测试消息：机器人已连通。
+服务器：$(hostname 2>/dev/null || echo '?')
+时间：$(date '+%F %T')" || die "消息发送失败：请确认 chat_id 正确，且已先给机器人发过一条消息（/start）"
+  echo "测试消息已发送到 chat_id=$TG_CHAT_ID。"
+}
+tg_config() {
+  local token chat auto t
+  token="$(optv token)"; chat="$(optv chat-id tg-chat chat)"; auto="$(optv auto-push)"
+  tg_load >/dev/null 2>&1 || true
+  if [[ -z "$token$chat$auto" ]]; then
+    echo "Telegram 机器人配置（文件：$(tg_conf_path)，权限 600）"
+    if [[ -n "$TG_BOT_TOKEN" ]]; then echo "当前 Token：${TG_BOT_TOKEN%%:*}:***（已配置）"; else echo "当前 Token：未配置"; fi
+    echo "当前 chat_id：${TG_CHAT_ID:-未配置}"
+    echo "自动推送：$(if [[ "${TG_AUTO_PUSH:-0}" == 1 ]]; then echo 开; else echo 关; fi)"
+    echo "先给机器人发一条 /start，再运行 $(self_cmd) tg id 就能看到 chat_id。"
+    read -r -p "Bot Token（回车保持当前）: " t || t=""
+    token="${t:-$TG_BOT_TOKEN}"
+    read -r -p "允许的 chat_id / user_id（回车保持当前 ${TG_CHAT_ID:-空}）: " t || t=""
+    chat="${t:-$TG_CHAT_ID}"
+    read -r -p "新节点创建后自动推送分享链接？[y/N]（回车保持当前）: " t || t=""
+    case "${t,,}" in
+      y|yes|1) auto=1 ;;
+      n|no|0) auto=0 ;;
+      *) auto="${TG_AUTO_PUSH:-0}" ;;
+    esac
+  fi
+  token="${token:-$TG_BOT_TOKEN}"; chat="${chat:-$TG_CHAT_ID}"; auto="${auto:-${TG_AUTO_PUSH:-0}}"
+  [[ -n "$token" ]] || die "Bot Token 不能为空"
+  tg_valid_token "$token" || die "Token 格式不对（应形如 123456789:AAF...；请确认是从 @BotFather 复制完整 Token）"
+  [[ -n "$chat" ]] || die "chat_id 不能为空"
+  tg_valid_chat "$chat" || die "chat_id 只能是数字（可带负号）或 @频道名"
+  case "${auto,,}" in 1|y|yes|on|true) auto=1 ;; *) auto=0 ;; esac
+  TG_BOT_TOKEN="$token"; TG_CHAT_ID="$chat"; TG_AUTO_PUSH="$auto"
+  tg_conf_write
+  echo "已保存：$(tg_conf_path)（权限 600）"
+  echo "运行 $(self_cmd) tg test 验证；需要机器人常驻请运行 $(self_cmd) tg enable"
+}
+tg_script_path() {
+  local path
+  path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  [[ -f "$path" && "$path" != /dev/fd/* && "$path" != /proc/* ]] || die "机器人服务需要从一个已保存的脚本文件启动"
+  [[ ! "$path" =~ [[:space:]\"\\] ]] || die "脚本路径含空格或特殊字符，不能安全写入服务配置：$path"
+  printf '%s' "$path"
+}
+tg_service_install() {
+  local path
+  tg_load >/dev/null 2>&1 || die "先配置机器人的 Token 和 chat_id：$(self_cmd) tg config"
+  need_init
+  path="$(tg_script_path)"
+  if [[ "$INIT_SYS" == systemd ]]; then
+    if [[ -e "$TG_UNIT" ]] && ! grep -qxF "$TG_MARK" "$TG_UNIT" 2>/dev/null; then
+      die "$TG_UNIT 已存在且不属于本脚本；为保护现有服务未覆盖"
+    fi
+    cat >"$TG_UNIT" <<UNIT
+[Unit]
+Description=sing-box manager Telegram bot
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash ${path} tg poll
+Restart=always
+RestartSec=5
+User=root
+NoNewPrivileges=true
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+${TG_MARK}
+UNIT
+    chmod 644 "$TG_UNIT"
+    systemctl daemon-reload
+  elif is_openrc; then
+    if [[ -e "$TG_INIT" ]] && ! grep -qxF "$TG_MARK" "$TG_INIT" 2>/dev/null; then
+      die "$TG_INIT 已存在且不属于本脚本；为保护现有服务未覆盖"
+    fi
+    cat >"$TG_INIT" <<RC
+#!/sbin/openrc-run
+${TG_MARK}
+name="${TG_SERVICE}"
+description="sing-box manager Telegram bot"
+supervisor="supervise-daemon"
+command="/bin/bash"
+command_args="${path} tg poll"
+output_log="${TG_LOG}"
+error_log="${TG_LOG}"
+respawn_delay=5
+respawn_max=0
+RC
+    chmod 755 "$TG_INIT"
+    touch "$TG_LOG"
+    chmod 600 "$TG_LOG"
+  else
+    die "没有找到 systemd 或 OpenRC，无法把机器人安装成服务"
+  fi
+}
+tg_log_hint() { if is_openrc; then echo "tail -n 100 $TG_LOG"; else echo "journalctl -u $TG_SERVICE -n 100 --no-pager"; fi; }
+tg_service_start() {
+  tg_service_install
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl reset-failed "$TG_SERVICE" >/dev/null 2>&1 || true
+    systemctl enable "$TG_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$TG_SERVICE" >/dev/null 2>&1 || true
+    sleep 1
+    if [[ "$(systemctl is-active "$TG_SERVICE" 2>/dev/null)" != active ]]; then
+      die "机器人服务没能启动；查看：$(tg_log_hint)"
+    fi
+  else
+    rc-update add "$TG_SERVICE" default >/dev/null 2>&1 || true
+    rc-service "$TG_SERVICE" restart >/dev/null 2>&1 || rc-service "$TG_SERVICE" start >/dev/null 2>&1 || true
+    sleep 1
+    rc-service "$TG_SERVICE" status >/dev/null 2>&1 || die "机器人服务没能启动；查看：$(tg_log_hint)"
+  fi
+  echo "Telegram 机器人已启动（$TG_SERVICE），并已设为开机自启。发 /help 试试。"
+}
+tg_service_stop() {
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl stop "$TG_SERVICE" >/dev/null 2>&1 || true
+  else
+    rc-service "$TG_SERVICE" stop >/dev/null 2>&1 || true
+  fi
+  echo "已停止 $TG_SERVICE（节点服务不受影响）。"
+}
+tg_service_disable() {
+  tg_service_stop >/dev/null 2>&1 || true
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl disable "$TG_SERVICE" >/dev/null 2>&1 || true
+    if [[ -f "$TG_UNIT" ]] && grep -qxF "$TG_MARK" "$TG_UNIT" 2>/dev/null; then rm -f "$TG_UNIT"; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "已停用机器人并移除 $TG_UNIT。"
+  else
+    rc-update del "$TG_SERVICE" default >/dev/null 2>&1 || true
+    if [[ -f "$TG_INIT" ]] && grep -qxF "$TG_MARK" "$TG_INIT" 2>/dev/null; then rm -f "$TG_INIT"; fi
+    echo "已停用机器人并移除 $TG_INIT。"
+  fi
+}
+tg_service_status() {
+  if tg_load; then
+    echo "机器人配置：$(tg_conf_path)"
+    echo "  Token：${TG_BOT_TOKEN%%:*}:***（已配置）"
+    echo "  chat_id：$TG_CHAT_ID"
+    echo "  自动推送：$(if [[ "${TG_AUTO_PUSH:-0}" == 1 ]]; then echo 开; else echo 关; fi)"
+  else
+    echo "机器人配置：未配置（运行 $(self_cmd) tg config）"
+  fi
+  echo "=== 服务状态（${INIT_SYS}） ==="
+  if [[ "$INIT_SYS" == systemd ]]; then
+    systemctl --no-pager --full status "$TG_SERVICE" 2>/dev/null | head -n 12 || echo "未安装服务（运行 $(self_cmd) tg enable）"
+  else
+    rc-service "$TG_SERVICE" status 2>/dev/null || echo "未安装服务（运行 $(self_cmd) tg enable）"
+  fi
+}
+tg_service_logs() {
+  local n="${1:-100}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=100
+  if is_openrc; then
+    if [[ -s "$TG_LOG" ]]; then tail -n "$n" "$TG_LOG"; else echo "暂无日志（$TG_LOG）"; fi
+  else
+    journalctl -u "$TG_SERVICE" -n "$n" --no-pager 2>/dev/null || echo "暂无日志"
+  fi
+}
+tg_help_text() {
+  cat <<'TXT'
+singbox-manager 机器人命令：
+/status          服务状态和监听端口
+/list            节点列表
+/links [名称]    全部（或指定节点）的分享链接
+/push [名称]     同 /links
+/add <协议> [--port 8443 --sni auto ...]  新建节点（非交互）
+/del 名称        删除节点
+/scan [JP|dev]   Reality SNI 扫描
+/argo list       Argo 隧道节点
+/id              当前 chat_id
+/ping            测试连通
+/help            本帮助
+TXT
+}
+tg_add_node() {
+  # $1 协议；其余为 --选项
+  local proto="${1:-}"
+  [[ -n "$proto" ]] || die "用法：/add reality|hy2|tuic|anytls|trojan|ss|vmess|argo [--选项]"
+  shift
+  (
+    TG_SUPPRESS_AUTOPUSH=1
+    parse_opts "$@"
+    NONINT=1
+    prepare_manage >&2
+    case "${proto,,}" in
+      reality|vless) add_reality ;;
+      hy2|hysteria2) add_hy2 ;;
+      tuic) add_tuic ;;
+      anytls) add_anytls ;;
+      trojan) add_trojan ;;
+      ss|shadowsocks) add_ss ;;
+      vmess) add_vmess ;;
+      argo) add_argo ;;
+      *) die "不支持的协议：$proto" ;;
+    esac
+  )
+}
+tg_del_node() {
+  local tag="${1:-}"
+  [[ -n "$tag" ]] || die "用法：/del 节点名"
+  ( NONINT=1; prepare_manage >&2; remove_by_tag "$tag" )
+}
+tg_scan() {
+  local a1="${1:-}"
+  case "${a1,,}" in
+    "") ( NONINT=1; cmd_scan_sni ) ;;
+    big-tech|bigtech|cdn|cnd|dev|media|ecom|all) ( NONINT=1; OPTS[category]="$a1"; cmd_scan_sni ) ;;
+    [a-zA-Z][a-zA-Z]) ( NONINT=1; OPTS[region]="${a1^^}"; cmd_scan_sni ) ;;
+    *) die "用法：/scan [地区代码，如 JP] 或 [分类：big-tech/cdn/dev/media/ecom/all]" ;;
+  esac
+}
+tg_argo_cmd() {
+  case "${1:-list}" in
+    list|"") argo_list ;;
+    url|refresh) argo_refresh "${2:-}" ;;
+    add) shift; tg_add_node argo "$@" ;;
+    *) die "用法：/argo [list | url 节点名 | add --proto vmess --quick]" ;;
+  esac
+}
+tg_handle_update() {
+  local upd="$1" chat text first cmd args out
+  chat="$(jq -r '.message.chat.id // empty' <<<"$upd" 2>/dev/null || true)"
+  [[ -n "$chat" ]] || return 0
+  text="$(jq -r '.message.text // empty' <<<"$upd" 2>/dev/null || true)"
+  if [[ -z "$text" ]]; then
+    tg_send_message "$chat" "暂时只支持文字命令，发 /help 查看可用命令。" || true
+    return 0
+  fi
+  if ! tg_authorized "$chat"; then
+    tg_send_message "$chat" "未授权的 chat_id：$chat
+请把该 id 写进 $(tg_conf_path) 的 TG_CHAT_ID，或在服务器上运行 $(self_cmd) tg config。" || true
+    return 0
+  fi
+  first="${text%%[[:space:]]*}"
+  cmd="${first%%@*}"
+  if [[ "$text" == *[[:space:]]* ]]; then args="${text#*[[:space:]]}"; else args=""; fi
+  case "${cmd,,}" in
+    /start|/help) tg_send_message "$chat" "$(tg_help_text)" || true ;;
+    /id) tg_send_message "$chat" "chat_id：$chat" || true ;;
+    /ping) tg_send_message "$chat" "pong（$(date '+%F %T')）" || true ;;
+    /status)
+      if out="$(prepare_manage >&2; status 2>&1)"; then tg_send_message "$chat" "$out" || true
+      else tg_send_message "$chat" "执行失败：
+$out" || true; fi ;;
+    /list)
+      if out="$(prepare_manage >&2; list_nodes 2>&1)"; then tg_send_message "$chat" "$out" || true
+      else tg_send_message "$chat" "执行失败：
+$out" || true; fi ;;
+    /links|/push|/nodes)
+      if out="$(tg_collect_links "$args" 2>&1)"; then
+        [[ -n "${out//[[:space:]]/}" ]] || out="没有可推送的分享链接。"
+        tg_send_message "$chat" "$out" || true
+      else
+        tg_send_message "$chat" "执行失败：
+$out" || true
+      fi ;;
+    /add)
+      if out="$(tg_add_node "$args" 2>&1)"; then tg_send_message "$chat" "${out:-已完成}" || true
+      else tg_send_message "$chat" "新建节点失败：
+$out" || true; fi ;;
+    /del)
+      if out="$(tg_del_node "$args" 2>&1)"; then tg_send_message "$chat" "${out:-已完成}" || true
+      else tg_send_message "$chat" "删除失败：
+$out" || true; fi ;;
+    /scan)
+      if out="$(tg_scan "$args" 2>&1)"; then tg_send_message "$chat" "${out:-没有结果}" || true
+      else tg_send_message "$chat" "扫描失败：
+$out" || true; fi ;;
+    /argo)
+      if out="$(tg_argo_cmd "$args" 2>&1)"; then tg_send_message "$chat" "${out:-已完成}" || true
+      else tg_send_message "$chat" "执行失败：
+$out" || true; fi ;;
+    *) tg_send_message "$chat" "不认识的命令：$cmd
+$(tg_help_text)" || true ;;
+  esac
+  return 0
+}
+tg_lock_release() {
+  local lock="$DATA/.tgbot.lock" pid
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  [[ "$pid" == "$$" ]] || return 0
+  rm -f "$lock/pid"
+  rmdir "$lock" 2>/dev/null || true
+}
+tg_lock_acquire() {
+  local lock="$DATA/.tgbot.lock" pid
+  mkdir -p "$DATA"
+  if mkdir "$lock" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock/pid"
+    trap 'tg_lock_release' EXIT
+    trap 'exit 0' INT TERM
+    return 0
+  fi
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    die "Telegram 机器人已经有一个实例在运行（PID $pid）；如需重启：$(self_cmd) tg start"
+  fi
+  rm -rf "$lock"
+  mkdir "$lock" 2>/dev/null && printf '%s\n' "$$" >"$lock/pid" || die "无法取得机器人运行锁：$lock"
+  trap 'tg_lock_release' EXIT
+  trap 'exit 0' INT TERM
+}
+tg_bot_loop() {
+  need_jq
+  tg_load || die "还没有配置 Telegram 机器人（运行 $(self_cmd) tg config）"
+  tg_lock_acquire
+  local offset resp upd update_id
+  offset="$(cat "$DATA/tgbot.offset" 2>/dev/null || true)"
+  [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+  echo "Telegram 机器人已启动：chat_id=$TG_CHAT_ID，offset=$offset"
+  while true; do
+    resp="$(tg_api_json getUpdates "$(jq -n --argjson o "$offset" '{offset:$o,timeout:50,allowed_updates:["message"]}')" 70 2>/dev/null || true)"
+    if [[ -n "$resp" ]] && jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1; then
+      while IFS= read -r upd; do
+        [[ -n "$upd" ]] || continue
+        update_id="$(jq -r '.update_id // empty' <<<"$upd" 2>/dev/null || true)"
+        [[ "$update_id" =~ ^[0-9]+$ ]] || continue
+        offset=$((update_id + 1))
+        printf '%s' "$offset" >"$DATA/tgbot.offset" 2>/dev/null || true
+        tg_handle_update "$upd" || true
+      done < <(jq -c '.result[]?' <<<"$resp" 2>/dev/null)
+    else
+      sleep 3
+    fi
+  done
+}
+tg_id_help() {
+  tg_load >/dev/null 2>&1 || true
+  [[ -n "$TG_BOT_TOKEN" ]] || die "还没有配置机器人 Token（运行 $(self_cmd) tg config）"
+  echo "给机器人发一条消息后，用下面的接口读取最近的会话 id："
+  local resp
+  resp="$(tg_api_json getUpdates "$(jq -n '{timeout:0,allowed_updates:["message"]}')" 20 || true)"
+  if jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1; then
+    jq -r '.result[]? | "chat_id=\(.message.chat.id)  名称：\(.message.chat.title // .message.chat.username // .message.chat.first_name // "-")"' <<<"$resp" | head -n 10
+    echo "（如果为空：先在 Telegram 里给机器人发一条 /start，再重新运行）"
+  else
+    die "读取失败：${resp:0:200}"
+  fi
+}
+tg_menu() {
+  local c t
+  while true; do
+    echo
+    echo "========== Telegram 机器人 =========="
+    echo "1) 配置 Bot Token / chat_id / 自动推送"
+    echo "2) 发送测试消息"
+    echo "3) 推送全部节点分享链接"
+    echo "4) 推送单个节点的分享链接"
+    echo "5) 启动机器人服务（常驻，支持 /add /del /scan 等）"
+    echo "6) 查看机器人服务状态"
+    echo "7) 查看机器人日志"
+    echo "8) 停止机器人服务"
+    echo "9) 停用并移除服务文件与开机自启"
+    echo "0) 返回"
+    read -r -p "选择 [0-9]: " c || return 0
+    case "${c:-}" in
+      1) tg_config ;;
+      2) tg_test ;;
+      3) tg_push ;;
+      4) prompt t "节点名称" ""; [[ -n "$t" ]] && tg_push "$t" ;;
+      5) tg_service_start ;;
+      6) tg_service_status ;;
+      7) tg_service_logs 100 ;;
+      8) tg_service_stop ;;
+      9) tg_service_disable ;;
+      0) return 0 ;;
+      *) echo "无效选项" ;;
+    esac
+    pause
+  done
+}
+cmd_tg() {
+  case "${1:-menu}" in
+    config|set) tg_config ;;
+    test|ping) tg_test ;;
+    push|send|links) tg_push "${2:-}" ;;
+    start|enable|on) tg_service_start ;;
+    stop|off) tg_service_stop ;;
+    disable|remove) tg_service_disable ;;
+    restart) tg_service_stop >/dev/null 2>&1 || true; tg_service_start ;;
+    status|show) tg_service_status ;;
+    logs|log) tg_service_logs "${2:-100}" ;;
+    id) tg_id_help ;;
+    menu|bot) tg_menu ;;
+    poll|run) tg_bot_loop ;;
+    *) usage; exit 2 ;;
+  esac
 }
 
 add_telegram_socks() {
@@ -1837,16 +3221,17 @@ b64d() {
 }
 declare -A LQ=()
 L_SCHEME="" L_UI="" L_HOST="" L_PORT="" L_PATH="" L_QUERY=""
-PARSED_OUT="" PARSED_DESC="" PARSED_PROTO=""
+PARSED_OUT="" PARSED_DESC="" PARSED_PROTO="" L_VMESS_JSON=""
 parse_share_link() {
-  # 解析 vless / vmess / hysteria2 / hy2 / tuic / anytls / ss 链接，生成 sing-box 出站，结果放在 PARSED_OUT
-  local link="$1" rest frag="" hp kv k v arr=() dec ui vmess_raw vmess_net vmess_tls vmess_security vmess_aid vmess_sni vmess_host vmess_ins
+  # 解析 vless / vmess / trojan / hysteria2 / hy2 / tuic / anytls / ss 链接，生成 sing-box 出站，结果放在 PARSED_OUT
+  local link="$1" rest frag="" hp kv k v arr=() dec ui vmess_raw vmess_net vmess_tls vmess_security vmess_aid vmess_sni vmess_host vmess_ins vmess_path
+  L_VMESS_JSON=""
   link="${link//[[:space:]]/}"
-  [[ "$link" == *://* ]] || die "这不是分享链接（应以 vless:// vmess:// hysteria2:// tuic:// anytls:// ss:// 开头）"
+  [[ "$link" == *://* ]] || die "这不是分享链接（应以 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// ss:// 开头）"
   L_SCHEME="${link%%://*}"; L_SCHEME="${L_SCHEME,,}"
   rest="${link#*://}"
   if [[ "$L_SCHEME" == vmess ]]; then
-    # 标准 VMess 分享链接是 Base64(JSON)，目前中转解析支持 TCP（可选 TLS）。
+    # 标准 VMess 分享链接是 Base64(JSON)；支持 TCP 和 WebSocket 传输，可选 TLS（Argo 节点就是 VMess + WS + TLS）。
     rest="${rest%%#*}"
     vmess_raw="$(b64d "$rest")"
     jq -e 'type == "object" and ((.add | type) == "string" and (.add | length) > 0) and ((.id | type) == "string" and (.id | length) > 0) and (.port != null)' <<<"$vmess_raw" >/dev/null 2>&1 || die "无法解析 VMess 分享链接（应为 vmess://Base64(JSON)）"
@@ -1857,7 +3242,7 @@ parse_share_link() {
     valid_port "$L_PORT" || die "VMess 链接里的端口无效：$L_PORT"
     L_PORT="$((10#$L_PORT))"
     vmess_net="$(jq -r '.net // "tcp" | ascii_downcase' <<<"$vmess_raw")"
-    case "$vmess_net" in tcp|raw) ;; *) die "VMess 中转目前仅支持 TCP 传输；该链接使用 net=$vmess_net" ;; esac
+    case "$vmess_net" in tcp|raw) vmess_net=tcp ;; ws) ;; *) die "VMess 中转只支持 tcp / ws 传输；该链接使用 net=$vmess_net" ;; esac
     vmess_tls="$(jq -r '.tls // "" | ascii_downcase' <<<"$vmess_raw")"
     case "$vmess_tls" in ""|none|tls) ;; *) die "不支持 VMess TLS 模式：$vmess_tls" ;; esac
     vmess_security="$(jq -r '.scy // .security // "auto" | ascii_downcase' <<<"$vmess_raw")"
@@ -1866,10 +3251,14 @@ parse_share_link() {
     [[ "$vmess_aid" =~ ^[0-9]+$ ]] || die "VMess 链接里的 alterId 无效"
     vmess_host="$(jq -r '.host // empty' <<<"$vmess_raw")"
     vmess_sni="$(jq -r '.sni // empty' <<<"$vmess_raw")"
+    vmess_path="$(jq -r '.path // empty' <<<"$vmess_raw")"
     vmess_ins="$(jq -r 'if .allowInsecure == true or .allowInsecure == 1 or .allowInsecure == "true" then "true" else "false" end' <<<"$vmess_raw")"
+    L_VMESS_JSON="$vmess_raw"
     PARSED_PROTO="VMess"
-    PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg uuid "$L_UI" --arg security "$vmess_security" --argjson aid "$vmess_aid" --arg tls "$vmess_tls" --arg sni "$vmess_sni" --arg host "$vmess_host" --arg ins "$vmess_ins" '
-      {type:"vmess",server:$server,server_port:$port,uuid:$uuid,security:$security,alter_id:$aid,network:"tcp"}
+    [[ "$vmess_net" == ws ]] && PARSED_PROTO="VMess + WS"
+    PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg uuid "$L_UI" --arg security "$vmess_security" --argjson aid "$vmess_aid" --arg tls "$vmess_tls" --arg sni "$vmess_sni" --arg host "$vmess_host" --arg ins "$vmess_ins" --arg net "$vmess_net" --arg path "$vmess_path" '
+      {type:"vmess",server:$server,server_port:$port,uuid:$uuid,security:$security,alter_id:$aid}
+      + (if $net == "ws" then {transport:({type:"ws",path:(if $path == "" then "/" else $path end)} + (if $host != "" then {headers:{Host:$host}} else {} end))} else {} end)
       + (if $tls == "tls" then {tls:{enabled:true,server_name:(if $sni != "" then $sni elif $host != "" then $host else $server end),insecure:($ins == "true")}} else {} end)')"
     PARSED_DESC="$PARSED_PROTO $(uri_host "$L_HOST"):$L_PORT"
     return 0
@@ -1964,16 +3353,33 @@ parse_share_link() {
       [[ "$ui" == *:* ]] || die "无法解析 ss 链接的加密方式和密码"
       PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg m "${ui%%:*}" --arg pw "${ui#*:}" \
         '{type:"shadowsocks", server:$server, server_port:$port, method:$m, password:$pw}')" ;;
-    *) die "暂不支持 $L_SCHEME:// 链接（支持 vless、hysteria2/hy2、tuic、anytls、ss）" ;;
+    trojan)
+      PARSED_PROTO="Trojan"
+      local tnet="${LQ[type]:-tcp}" tpath="" thost="${LQ[host]:-}" tpw
+      tpath="${LQ[path]:-${L_PATH:-}}"
+      [[ -z "${LQ[plugin]:-}" ]] || die "不支持带 plugin 的 trojan 链接"
+      case "$tnet" in tcp|raw) tnet=tcp ;; ws|grpc) ;; *) die "不支持的 Trojan 传输方式：$tnet" ;; esac
+      tpw="$(urldecode "$L_UI")"
+      [[ -n "$tpw" ]] || die "Trojan 链接缺少密码"
+      PARSED_OUT="$(jq -nc --arg server "$L_HOST" --argjson port "$L_PORT" --arg pw "$tpw" --arg sni "$sni" --arg ins "$ins" \
+        --arg net "$tnet" --arg path "$tpath" --arg host "$thost" --arg svc "${LQ[serviceName]:-}" --arg alpn "$alpn" '
+        {type:"trojan", server:$server, server_port:$port, password:$pw,
+         tls:({enabled:true, server_name:(if $sni == "" then $server else $sni end), insecure:($ins == "1" or $ins == "true")}
+              + (if $alpn != "" then {alpn:($alpn | split(","))} else {} end))}
+        + (if $net == "ws" then {transport:({type:"ws", path:(if $path == "" then "/" else $path end)} + (if $host != "" then {headers:{Host:$host}} else {} end))}
+           elif $net == "grpc" then {transport:{type:"grpc", service_name:$svc}}
+           else {} end)')" ;;
+    *) die "暂不支持 $L_SCHEME:// 链接（支持 vless、vmess、trojan、hysteria2/hy2、tuic、anytls、ss）" ;;
   esac
   PARSED_DESC="$PARSED_PROTO $(uri_host "$L_HOST"):$L_PORT"
 }
 manual_landing() {
   # 手动填写落地节点，拼成分享链接后交给 parse_share_link
-  local c h p a b c2 d link vmess_json vmess_host
+  local c h p a b c2 d e link vmess_json vmess_host
   echo "落地节点协议："
   echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks   6) VMess TCP"
-  read -r -p "选择 [1-6]: " c || die "没有选择协议"
+  echo "7) Trojan            8) VMess + WS/TLS（Argo / CDN）"
+  read -r -p "选择 [1-8]: " c || die "没有选择协议"
   prompt h "落地服务器地址（IP 或域名）" ""
   h="${h#[}"; h="${h%]}"
   valid_host "$h" || die "地址无效"
@@ -1997,13 +3403,21 @@ manual_landing() {
        vmess_json="$(jq -nc --arg host "$vmess_host" --arg port "$p" --arg uuid "$a" \
          '{v:"2",ps:"relay",add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"",sni:""}')"
        link="vmess://$(printf '%s' "$vmess_json" | base64 -w0)" ;;
+    7) prompt a "密码"; prompt b "SNI（证书域名，可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
+       link="trojan://$(urlencode "$a")@${h}:${p}?security=tls&sni=$(urlencode "$b")&type=tcp&allowInsecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
+    8) prompt a "VMess UUID"; prompt b "SNI / Host（Argo 或 CDN 域名）"; prompt e "WebSocket path" "/"
+       vmess_host="${h#[}"; vmess_host="${vmess_host%]}"
+       [[ "$e" == /* ]] || die "WebSocket path 必须以 / 开头"
+       vmess_json="$(jq -nc --arg host "$vmess_host" --arg port "$p" --arg uuid "$a" --arg hh "$b" --arg path "$e" \
+         '{v:"2",ps:"relay",add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"ws",type:"none",host:$hh,path:$path,tls:"tls",sni:$hh}')"
+       link="vmess://$(printf '%s' "$vmess_json" | base64 -w0)" ;;
     *) die "无效选项" ;;
   esac
   parse_share_link "$link"
 }
 read_landing() {
   local link
-  echo "落地节点：粘贴分享链接（vless / vmess TCP / hysteria2 / hy2 / tuic / anytls / ss），直接回车改为手动填写。"
+  echo "落地节点：粘贴分享链接（vless / vmess（TCP 或 WS）/ trojan / hysteria2 / hy2 / tuic / anytls / ss），直接回车改为手动填写。"
   read -r -p "落地节点分享链接: " link || link=""
   if [[ -n "${link//[[:space:]]/}" ]]; then parse_share_link "$link"; else manual_landing; fi
   echo "落地节点：$PARSED_DESC"
@@ -2017,17 +3431,19 @@ relay_add() {
   read_landing
   landing_host="$L_HOST"; landing_port="$L_PORT"; proto="$PARSED_PROTO"
   case "$PARSED_OUT" in
-    *'"type":"vless"'*|*'"type":"vmess"'*|*'"type":"anytls"'*|*'"type":"shadowsocks"'*)
+    *'"type":"vless"'*|*'"type":"vmess"'*|*'"type":"trojan"'*|*'"type":"anytls"'*|*'"type":"shadowsocks"'*)
       if tcp_reachable "$landing_host" "$landing_port"; then echo "落地端口 TCP 可以连通。"
       else echo "提示：从本机连不上落地 ${landing_host}:${landing_port}（TCP），请确认落地节点在运行、防火墙已放行。仍会继续添加。"; fi ;;
   esac
   echo
   echo "中转入口协议（客户端连接本机时用的协议）："
   echo "1) VLESS + Reality   2) Hysteria2   3) TUIC   4) AnyTLS   5) Shadowsocks"
-  read -r -p "选择 [1-5，默认 1]: " c || c=1
+  echo "6) Trojan            7) VMess TCP   8) Argo（Cloudflare Tunnel，本机出站也走 CF）"
+  read -r -p "选择 [1-8，默认 1]: " c || c=1
   RELAY_OUT="$PARSED_OUT"; RELAY_DESC="$PARSED_DESC"; TAG_PREFIX="relay-"; LAST_TAG=""
   case "${c:-1}" in
     1) add_reality ;; 2) add_hy2 ;; 3) add_tuic ;; 4) add_anytls ;; 5) add_ss ;;
+    6) add_trojan ;; 7) add_vmess ;; 8) add_argo ;;
     *) die "无效选项" ;;
   esac
   mkdir -p "$RELAY_DIR"
@@ -2051,7 +3467,7 @@ forward_add() {
   if [[ "$target" == *://* ]]; then
     parse_share_link "$target"
     thost="$L_HOST"; tport="$L_PORT"; link_mode=1
-    case "$L_SCHEME" in hysteria2|hy2|tuic) def_net=udp ;; vless|anytls) def_net=tcp ;; *) def_net=both ;; esac
+    case "$L_SCHEME" in hysteria2|hy2|tuic) def_net=udp ;; vless|anytls|trojan) def_net=tcp ;; *) def_net=both ;; esac
   else
     if [[ "$target" == \[*\]:* ]]; then thost="${target%%]*}"; thost="${thost#[}"; tport="${target##*]:}"
     else thost="${target%:*}"; tport="${target##*:}"; fi
@@ -2080,9 +3496,10 @@ forward_add() {
   mkdir -p "$RELAY_DIR"
   meta="$RELAY_DIR/$tag.json"
   jq -n --arg tag "$tag" --argjson port "$port" --arg net "$net" --arg h "$thost" --argjson tp "$tport" --argjson lm "$link_mode" \
-    --arg scheme "$L_SCHEME" --arg ui "$L_UI" --arg path "$L_PATH" --arg q "$L_QUERY" \
+    --arg scheme "$L_SCHEME" --arg ui "$L_UI" --arg path "$L_PATH" --arg q "$L_QUERY" --arg vj "$L_VMESS_JSON" \
     '{kind:"forward", tag:$tag, listen_port:$port, network:$net, target:$h, target_port:$tp}
-     + (if $lm == 1 then {link:{scheme:$scheme, userinfo:$ui, path:$path, query:$q}} else {} end)' >"$meta"
+     + (if $lm == 1 then {link:({scheme:$scheme, userinfo:$ui, path:$path, query:$q}
+                                    + (if $vj != "" then {vmess_json:$vj} else {} end))} else {} end)' >"$meta"
   chmod 600 "$meta"
   echo
   echo "端口转发已添加：本机 ${port}/${net} → $(uri_host "$thost"):${tport}"
@@ -2091,11 +3508,19 @@ forward_add() {
 }
 print_forward_link() {
   # 转发目标是分享链接时：把原链接的地址和端口换成本机，生成给客户端用的新链接
-  local f="$1" h="$2"
+  local f="$1" h="$2" port json
   jq -e '.link' "$f" >/dev/null 2>&1 || {
     echo "客户端用法：使用落地节点原来的配置，只把地址改成 $h、端口改成 $(jq -r .listen_port "$f")。"
     return 0
   }
+  port="$(jq -r .listen_port "$f")"
+  if [[ -n "$(jq -r '.link.vmess_json // empty' "$f" 2>/dev/null)" ]]; then
+    # VMess 是 Base64(JSON)，直接重建 JSON 才能把地址和端口换成本机
+    echo "分享链接（VMess，地址和端口已换成本机）："
+    json="$(jq -r '.link.vmess_json' "$f" | jq -c --arg h "$(uri_host "$h")" --arg p "$port" '.add = $h | .port = $p')"
+    printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 -w0)"
+    return 0
+  fi
   echo "分享链接（落地节点链接，地址已换成本机）："
   jq -r --arg h "$(uri_host "$h")" '"\(.link.scheme)://\(.link.userinfo)@\($h):\(.listen_port)\(.link.path)\(if .link.query != "" then "?" + .link.query else "" end)#\(.tag)"' "$f"
 }
@@ -2113,8 +3538,10 @@ relay_list() {
       echo "===== [中转] $(jq -r .tag "$f") ====="
       echo "客户端 → 本机 $(jq -r .entry "$f")（端口 $(jq -r .listen_port "$f")） → 落地 $(jq -r .landing_desc "$f")"
       if [[ -f "$DATA/$(jq -r .tag "$f").json" ]]; then
-        jq --arg h "$host" '.server = $h' "$DATA/$(jq -r .tag "$f").json" >"$f.node.tmp"
-        install -m 600 "$f.node.tmp" "$DATA/$(jq -r .tag "$f").json"; rm -f "$f.node.tmp"
+        if [[ "$(jq -r '.protocol' "$DATA/$(jq -r .tag "$f").json")" != *Argo* ]]; then
+          jq --arg h "$host" '.server = $h' "$DATA/$(jq -r .tag "$f").json" >"$f.node.tmp"
+          install -m 600 "$f.node.tmp" "$DATA/$(jq -r .tag "$f").json"; rm -f "$f.node.tmp"
+        fi
         print_link "$DATA/$(jq -r .tag "$f").json"
       fi
     else
@@ -2131,6 +3558,7 @@ remove_by_tag() {
   local tag="$1" out=""
   [[ -f "$XRAY_DATA/$tag.json" ]] && { xray_remove_node "$tag"; return 0; }
   jq -e --arg tag "$tag" '.inbounds[]? | select(.tag == $tag)' "$CONF" >/dev/null || die "未找到节点 $tag"
+  [[ -f "$ARGO_DIR/$tag.json" ]] && argo_remove_service "$tag"
   [[ -f "$RELAY_DIR/$tag.json" ]] && out="$(jq -r '.outbound // empty' "$RELAY_DIR/$tag.json")"
   commit_jq --arg tag "$tag" --arg out "$out" '
     def inb: (.inbound // []) | if type == "string" then [.] else . end;
@@ -2141,7 +3569,7 @@ remove_by_tag() {
                                  (if (inb | length) == 1 then empty else .inbound = (inb - [$tag]) end)
                                else . end))
        else . end)'
-  rm -f "$DATA/${tag}.json" "$RELAY_DIR/${tag}.json"
+  rm -f "$DATA/${tag}.json" "$RELAY_DIR/${tag}.json" "$ARGO_DIR/${tag}.json"
   echo "已删除：$tag"
 }
 relay_remove() {
@@ -2215,7 +3643,10 @@ cmd_fp() {
   proto="$(jq -r .protocol "$node")"
   case "$proto" in
     "VLESS + Reality"|AnyTLS) ;;
-    *) echo "$tag 是 ${proto}：Hysteria2、TUIC 走 QUIC，Shadowsocks 没有 TLS，都不使用 uTLS 指纹，无需设置。"; return 0 ;;
+    *Argo*)
+      echo "$tag 是 Argo 节点：TLS 由 Cloudflare 边缘提供，本机入站是明文 WebSocket，不使用 uTLS 指纹，无需设置。"
+      return 0 ;;
+    *) echo "$tag 是 ${proto}：Hysteria2、TUIC 走 QUIC，Shadowsocks 没有 TLS，Trojan 默认不使用 uTLS 指纹，都无需设置。"; return 0 ;;
   esac
   cur="$(node_fps "$node")"
   local mode=""
@@ -2285,6 +3716,9 @@ cmd_port() {
   fi
   [[ -n "$tag" ]] || die "名称不能为空"
   valid_tag "$tag"
+  if [[ -f "$ARGO_DIR/$tag.json" ]]; then
+    die "$tag 是 Argo 节点：本地端口由 cloudflared 隧道指向 127.0.0.1:$(jq -r .local_port "$ARGO_DIR/$tag.json")，不能直接改端口。请用 $(self_cmd) argo remove $tag 删除后用新端口重新添加。"
+  fi
   if [[ -f "$XRAY_DATA/$tag.json" ]]; then xray_change_port "$tag" "$new"; return 0; fi
   old="$(jq -r --arg t "$tag" '.inbounds[]? | select(.tag == $t) | .listen_port' "$CONF")"
   [[ -n "$old" && "$old" != null ]] || die "配置里没有名为 $tag 的节点"
@@ -2693,6 +4127,12 @@ list_nodes() {
       printf '%-24s %-16s %-8s %s\n' "$(jq -r .tag "$f")" "VLESS/TLS $(jq -r .transport "$f")" "$(jq -r .port "$f")" "::"
     done
   fi
+  if compgen -G "$ARGO_DIR/*.json" >/dev/null; then
+    echo "Argo（Cloudflare Tunnel）节点："
+    for f in "$ARGO_DIR"/*.json; do
+      printf '%-24s %-16s %-8s %s\n' "$(jq -r .tag "$f")" "Argo $(jq -r .proto "$f")" "$(jq -r .local_port "$f")" "$(jq -r .host "$f")"
+    done
+  fi
   echo
   echo "凭据文件（含敏感信息，权限仅 root 可读）：$DATA/*.json"
 }
@@ -2716,7 +4156,8 @@ show_links() {
   fi
   host="$(public_host)"
   for f in "${files[@]}"; do
-    if [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
+    # Argo 节点的连接地址是 Cloudflare 域名，不能改成本机公网地址
+    if [[ "$(jq -r '.protocol // empty' "$f")" != *Argo* ]] && [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
       jq --arg h "$host" '.server = $h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"
       rm -f "$f.tmp"
     fi
@@ -2757,9 +4198,10 @@ status() {
 firewall_help() {
   cat <<'TXT'
 本脚本不会自动修改防火墙。请仅放行你实际使用的节点端口：
-  Reality / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
+  Reality / AnyTLS / Shadowsocks / Telegram SOCKS5 / Trojan / Xray VLESS + TLS：TCP
   Hysteria2 / TUIC：UDP
   端口转发：按添加时选择的 tcp / udp / both 放行
+  Argo（Cloudflare Tunnel）：本机 WebSocket 入站只监听 127.0.0.1，不需要对外放行端口；只需本机可以出站访问 Cloudflare
 
 检查本机规则：
   ufw status verbose
@@ -2955,7 +4397,7 @@ format_du_kib() {
   awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.2f GiB (%.0f KiB)", k/1048576, k; else if (k >= 1024) printf "%.2f MiB (%.0f KiB)", k/1024, k; else printf "%.0f KiB", k }'
 }
 cmd_storage() {
-  local script_path shortcut_path script_kib=0 service_kib sb_kib xray_kib backup_kib log_kib total
+  local script_path shortcut_path script_kib=0 service_kib sb_kib xray_kib backup_kib log_kib argo_kib total
   script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
   [[ -f "$script_path" ]] || script_path=""
   if [[ -z "$script_path" ]] && shortcut_is_ours; then script_path="$SHORTCUT"; fi
@@ -2972,13 +4414,15 @@ cmd_storage() {
   script_kib=$((script_kib + service_kib))
   sb_kib="$(sum_du_kib "$CONF_DIR")"
   xray_kib=$(( $(du_kib "$XRAY_DIR") + $(du_kib "$XRAY_BIN") ))
+  argo_kib=$(( $(du_kib "$ARGO_BIN") + $(du_kib "$ARGO_DIR") ))
   backup_kib="$(sum_du_kib "$BACKUP_DIR" "$XRAY_BACKUP_DIR")"
   log_kib="$(sum_du_kib "$SB_LOG" "$XRAY_LOG")"
-  total=$((script_kib + sb_kib + xray_kib + backup_kib + log_kib))
+  total=$((script_kib + sb_kib + xray_kib + argo_kib + backup_kib + log_kib))
   echo "管理器相关磁盘占用（du -sk，按已分配空间估算；只统计下列路径）："
   printf '  管理脚本、sb 快捷命令与服务文件：%s\n' "$(format_du_kib "$script_kib")"
   printf '  sing-box 配置、节点元数据与证书：%s\n' "$(format_du_kib "$sb_kib")"
   printf '  Xray sidecar 配置、节点元数据、证书与内核：%s\n' "$(format_du_kib "$xray_kib")"
+  printf '  Argo（cloudflared 程序与隧道记录）：%s\n' "$(format_du_kib "$argo_kib")"
   printf '  管理器备份：%s\n' "$(format_du_kib "$backup_kib")"
   printf '  管理器日志文件：%s\n' "$(format_du_kib "$log_kib")"
   printf '  合计：%s\n' "$(format_du_kib "$total")"
@@ -3316,8 +4760,19 @@ singbox-manager ${SCRIPT_VERSION}
   menu             打开管理菜单
   5|ss|add-ss      直接添加 Shadowsocks 节点（安装后也可运行 sb5）
   tg               添加 Telegram SOCKS5 代理节点（不支持 MTProto）
+  tg config        配置 Telegram 机器人（--token / --chat-id / --auto-push）
+  tg test          给机器人发一条测试消息（同时验证 Token 和 chat_id）
+  tg push [名称]   推送全部（或指定节点）分享链接到 Telegram
+  tg id            查看给机器人发过消息的 chat_id
+  tg enable|start  安装并启动常驻机器人服务（支持 /add /del /scan 等命令）
+  tg stop|restart|status|disable|logs  机器人服务的停 / 重启 / 状态 / 停用 / 日志
+  tgbot [菜单]     同 tg 机器人子命令（不带参数时打开机器人菜单）
   links            查看所有节点的参数和分享链接
   vmess|add-vmess  添加 VMess AEAD（TCP）节点
+  trojan|add-trojan 添加 Trojan 节点（TLS + 密码）
+  add <协议> [选项] 添加节点（可脚本化）：reality|vless-reality|hy2|tuic|anytls|trojan|ss|vmess|argo|tg|xray
+  argo [add|list|url|log|remove]  管理 Argo（Cloudflare Tunnel）节点
+  scan-sni [选项]  Reality SNI 扫描：--region 地区 / --category 分类 / --list 列表 / --file 文件 / --auto
   add-all          新增全部 8 类节点并输出 v2rayNG / NekoBox 两组 Base64 导入内容
   bbr [status|reset] 自动选用内核支持的标准 TCP BBR；status 查看，reset 恢复
   storage          统计管理脚本、节点数据、备份和日志的磁盘占用（只读）
@@ -3341,6 +4796,36 @@ singbox-manager ${SCRIPT_VERSION}
   shortcut         创建或刷新 sb 快捷命令
   remove-shortcut  删除 sb 快捷命令（不影响 sing-box 和节点）
   version          显示脚本版本
+
+非交互选项（跟在上面的添加类命令后面）：
+  -y, --yes, --non-interactive   不提问，没给的参数用默认值
+  --tag / --name <名称>          节点名称（默认自动生成，如 reality-1）
+  --port <端口>                  端口（默认自动选空闲端口）
+  --sni <域名|auto>              Reality SNI；auto = 按出口地区扫描后自动选最快的
+  --fps <chrome,firefox|all>     客户端 TLS 指纹（Reality / AnyTLS）
+  --method <加密方式>            Shadowsocks 加密方式
+  --domain / --tls-host <域名>   TLS 证书的域名或 IP（Trojan / Hysteria2 / TUIC / AnyTLS / Argo 命名隧道）
+  --self-signed                  强制使用自签证书（默认就是自签）
+  --cert <cert.pem> --key <key.pem>  使用已有证书（例如 acme.sh / Let's Encrypt）
+  --proto <vmess|vless>          Argo 节点的 WebSocket 协议
+  --quick                        Argo 快速隧道（trycloudflare.com）
+  --token <TOKEN>                Argo 命名隧道 Token（配合 --domain）
+  --tg-push                      创建节点后把它的分享链接推送到 Telegram（需要先 tg config）
+  --path <路径>                  Argo 节点的 WebSocket 路径
+  --region <US|JP|…>             SNI 扫描使用哪个地区的候选列表（默认按本机出口地区）
+  --category <big-tech|cdn|dev|media|ecom|all>  SNI 扫描的分类
+  --list <a.com,b.com> / --file <文件>  SNI 扫描的自定义域名列表
+  --auto                         SNI 扫描后直接输出最快的域名
+  --parallel <1-32>              SNI 扫描并发数（默认 6）
+
+示例：
+  $(self_cmd) add reality --sni auto --port 443 -y
+  $(self_cmd) add trojan --domain vps.example.com --self-signed -y
+  $(self_cmd) add hy2 --port 8443 -y
+  $(self_cmd) add argo --proto vmess --quick -y
+  $(self_cmd) add argo --proto vless --token <TOKEN> --domain argo.example.com -y
+  $(self_cmd) scan-sni --region JP
+  $(self_cmd) scan-sni --category dev --auto
 TXT
 }
 add_single_inbound() {
@@ -3354,7 +4839,9 @@ add_single_inbound() {
   echo "6) Telegram SOCKS5（不支持 MTProto）"
   echo "7) VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
   echo "8) VMess AEAD 入站（TCP；alterId=0）"
-  if ! read -r -p "选择 [1-8，默认 1]: " choice; then
+  echo "9) Trojan（TLS + 密码）"
+  echo "10) Argo（Cloudflare Tunnel + VMess/VLESS WS）"
+  if ! read -r -p "选择 [1-10，默认 1]: " choice; then
     echo "没有选择，已取消。"
     return 0
   fi
@@ -3367,6 +4854,8 @@ add_single_inbound() {
     6) add_telegram_socks ;;
     7) xray_add_node ;;
     8) add_vmess ;;
+    9) add_trojan ;;
+    10) add_argo ;;
     *) echo "无效选项，没有添加入站。" ;;
   esac
 }
@@ -3401,8 +4890,13 @@ menu() {
     echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
     echo "25) 查看 sing-box 入/出累计流量"
     echo "26) 添加 VMess AEAD（TCP；alterId=0）"
+    echo "27) 添加 Trojan（TLS + 密码）"
+    echo "28) 添加 Argo 节点（Cloudflare Tunnel + VMess/VLESS WS）"
+    echo "29) Reality SNI 扫描（按地区/分类/自定义列表验证 TLS1.3、X25519、证书与 HTTP/2）"
+    echo "30) Telegram 机器人（配置 / 测试 / 推送 / 启停 / 日志）"
+    echo "31) 推送节点分享链接到 Telegram（全部或单个）"
     echo "0) 退出"
-    read -r -p "选择 [0-26]: " choice || exit 0
+    read -r -p "选择 [0-31]: " choice || exit 0
     case "$choice" in
       1) add_single_inbound ;;
       2) add_hy2 ;;
@@ -3430,6 +4924,11 @@ menu() {
       24) watchdog_menu ;;
       25) cmd_traffic show ;;
       26) add_vmess ;;
+      27) add_trojan ;;
+      28) add_argo ;;
+      29) cmd_scan_sni ;;
+      30) tg_menu ;;
+      31) tg_push ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -3453,6 +4952,9 @@ prepare_manage() {
 }
 main() {
   if [[ "${0##*/}" == sb5 && $# -eq 0 ]]; then set -- add-ss; fi
+  parse_opts "$@"
+  if opt_bool help; then usage; exit 0; fi
+  if (( ${#PARGS[@]} )); then set -- "${PARGS[@]}"; else set --; fi
   case "${1:-menu}" in
     -h|--help|help) usage; exit 0 ;;
     version|-v|--version) echo "singbox-manager ${SCRIPT_VERSION}"; exit 0 ;;
@@ -3495,6 +4997,25 @@ TXT
     menu) prepare_manage; menu ;;
     5|ss|shadowsocks|add-ss|sb5) prepare_manage; add_ss ;;
     vmess|add-vmess) prepare_manage; add_vmess ;;
+    trojan|add-trojan) prepare_manage; add_trojan ;;
+    add|add-node)
+      prepare_manage
+      case "${2:-}" in
+        reality|vless-reality) add_reality ;;
+        hy2|hysteria2) add_hy2 ;;
+        tuic) add_tuic ;;
+        anytls) add_anytls ;;
+        trojan) add_trojan ;;
+        ss|shadowsocks|5) add_ss ;;
+        vmess) add_vmess ;;
+        argo|cloudflared) add_argo ;;
+        tg|telegram|socks5) add_telegram_socks ;;
+        xray|vless-tls) xray_add_node ;;
+        "") add_single_inbound ;;
+        *) die "未知协议：${2}（可用：reality、hy2、tuic、anytls、trojan、ss、vmess、argo、tg、xray）" ;;
+      esac ;;
+    argo) cmd_argo "${2:-add}" "${3:-}" "${4:-}" ;;
+    scan-sni|sni-scan|sni|scan) cmd_scan_sni ;;
     relay)
       prepare_manage
       case "${2:-menu}" in
@@ -3505,7 +5026,11 @@ TXT
         del|rm|remove) relay_remove "${3:-}" ;;
         *) usage; exit 2 ;;
       esac ;;
-    tg|telegram|socks5) prepare_manage; add_telegram_socks ;;
+    tg)
+      # 不带子命令时保持原来的行为：添加 Telegram SOCKS5 节点
+      if [[ -n "${2:-}" ]]; then cmd_tg "${2:-}" "${3:-}" "${4:-}"; else prepare_manage; add_telegram_socks; fi ;;
+    tgbot) cmd_tg "${2:-menu}" "${3:-}" "${4:-}" ;;
+    telegram|socks5) prepare_manage; add_telegram_socks ;;
     xray) prepare_manage
       case "${2:-status}" in
         add|node) xray_add_node ;;

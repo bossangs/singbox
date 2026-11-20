@@ -2,6 +2,8 @@
 
 一个 sing-box 多协议节点管理脚本，支持 **Debian / Ubuntu、AlmaLinux/RHEL 兼容发行版（systemd）** 和 **Alpine Linux（OpenRC）**：一键安装 sing-box 内核，通过交互菜单添加、查看、删除节点，自动识别服务器公网 IP 并生成客户端分享链接，还可以把一台 VPS 设置成**中转**（流量转到落地服务器）或做**端口转发**。安装后输入 `sb` 就能打开管理菜单。
 
+除了交互菜单，同样的流程也能用 `sb add <协议> [--选项]` 一条命令跑完（不用回答任何问题），适合批量部署。节点类型包括 VLESS Reality、VMess、Hysteria2、TUIC、AnyTLS、Shadowsocks、Trojan 和 Argo（Cloudflare Tunnel）；Reality 的 SNI 可以按 VPS 出口地区、分类或自定义列表扫描，并从本机逐台验证 TLS 1.3 / X25519 / 证书 / HTTP/2；TLS 协议支持每个节点独立自签证书；所有节点都能当落地或中转入口；还可以把节点链接推送到 Telegram，并用 Telegram 机器人远程管理。
+
 > 下面所有代码块里的命令都可以整行复制直接运行，不需要去掉任何序号或提示符。请先切换到 root：
 
 ```bash
@@ -70,9 +72,13 @@ sb
 | 6 | Telegram SOCKS5 | TCP | 1080 | sing-box SOCKS5 入站，自动生成用户名和密码；**不支持 MTProto** |
 | 20 / 菜单 1 选项 7 | 本机 VLESS + TLS 入站（Xray） | TCP | 8443 | 必须填写解析到本服务器的域名；连接地址、TLS/SNI 和证书都使用该域名 |
 | 26 / 菜单 1 选项 8 | VMess AEAD | TCP | 10086 | 标准 VMess `vmess://` 分享链接；`alterId=0`，不启用 TLS，连接到本机公网地址 |
+| 27 / 菜单 1 选项 9 | Trojan | TCP | 20443 | TLS + 密码；每个节点独立自签证书（也可以用已有证书），自签时分享链接自动带 `allowInsecure=1` |
+| 28 / 菜单 1 选项 10 | Argo（Cloudflare Tunnel） | WebSocket（本机只监听 `127.0.0.1`） | 18080 | 安装 `cloudflared`，本机建 VMess 或 VLESS WebSocket 入站，再由 Cloudflare 隧道对外；支持快速隧道（`trycloudflare.com`）和命名隧道（Token + 自己的域名） |
+
+> 菜单 **29** 是 Reality SNI 扫描，菜单 **30 / 31** 是 Telegram 机器人管理与链接推送，详见后面对应章节。
 
 UUID、密码、密钥等凭据全部在添加节点时随机生成，脚本里没有写死任何密码。
-菜单 **1** 的单个入站选择器可选上述 7 种 sing-box 协议，也可选 Xray VLESS + TLS；菜单 **2–6**、**20** 和 **26** 是对应协议的快捷添加项。VMess 使用标准 AEAD（`alterId=0`）和 TCP 直连，不启用 TLS。
+菜单 **1** 的单个入站选择器可选上面 9 种本机入站协议（含 Trojan 和 Argo），也可选 Xray VLESS + TLS；菜单 **2–6**、**20**、**26–28** 是对应协议的快捷添加项。VMess 使用标准 AEAD（`alterId=0`）和 TCP 直连，不启用 TLS。
 Telegram 内置代理支持 SOCKS5 和 MTProto；本脚本只通过 sing-box 提供兼容的 SOCKS5，不会把它称作 MTProto。
 
 ## 管理菜单
@@ -106,10 +112,15 @@ Telegram: https://t.me/tuiji_channel
 24) 节点服务保活/看门狗（启用/状态/检查/停用）
 25) 查看 sing-box 入/出累计流量
 26) 添加 VMess AEAD（TCP；alterId=0）
+27) 添加 Trojan（TLS + 密码）
+28) 添加 Argo 节点（Cloudflare Tunnel + VMess/VLESS WS）
+29) Reality SNI 扫描（按地区/分类/自定义列表验证 TLS1.3、X25519、证书与 HTTP/2）
+30) Telegram 机器人（配置 / 测试 / 推送 / 启停 / 日志）
+31) 推送节点分享链接到 Telegram（全部或单个）
 0) 退出
 ```
 
-菜单 **1** 会先让你选择要添加的本机入站协议；直接回车默认创建 VLESS + Reality + Vision，也可选择 Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、VLESS + TLS 或 VMess AEAD。菜单 **2–6**、**20** 和 **26** 仍可直接添加对应协议。VMess 以 TCP 直连本机公网地址，使用 `alterId=0`，并生成标准 `vmess://` 链接。VLESS + Reality 入站的服务器地址自动识别或按需填写，UUID、Reality 密钥和 short ID 在本机生成，SNI 与客户端指纹可配置。示例链接里的 `packetEncoding=xudp` 是客户端 VLESS 出站设置，不是服务端入站字段；sing-box 客户端默认使用 xudp，因此本机入站不需要单独配置它。
+菜单 **1** 会先让你选择要添加的本机入站协议；直接回车默认创建 VLESS + Reality + Vision，也可选择 Hysteria2、TUIC、AnyTLS、Shadowsocks、Telegram SOCKS5、VLESS + TLS、VMess AEAD、Trojan 或 Argo。菜单 **2–6**、**20**、**26–28** 仍可直接添加对应协议。原有菜单项和编号保持不变，新增的 27–31 项放在最后。VMess 以 TCP 直连本机公网地址，使用 `alterId=0`，并生成标准 `vmess://` 链接。VLESS + Reality 入站的服务器地址自动识别或按需填写，UUID、Reality 密钥和 short ID 在本机生成，SNI 与客户端指纹可配置。示例链接里的 `packetEncoding=xudp` 是客户端 VLESS 出站设置，不是服务端入站字段；sing-box 客户端默认使用 xudp，因此本机入站不需要单独配置它。
 
 ### sing-box 入站 / 出站累计流量
 
@@ -121,7 +132,7 @@ Telegram: https://t.me/tuiji_channel
 - 第一次添加节点时，脚本会**自动识别服务器公网 IP**（依次尝试多个 IPv4 查询服务，失败再试 IPv6，最后看本机网卡），并显示为默认值：直接回车就用这个 IP，也可以输入你的域名。地址会保存下来，之后不再询问。
 - 本机 Xray VLESS + TLS 入站必须输入有效域名；生成的客户端连接地址、TLS/SNI 和证书都会使用它。请先把域名解析到这台服务器。
 - Reality 和 AnyTLS 会让你选择客户端 TLS 指纹，可以选多个或 `all`，直接回车就是 `chrome`（见下文“TLS 指纹”）。
-- Reality 需要填写 SNI / 握手域名；Hysteria2、TUIC、AnyTLS 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址）；Shadowsocks 需要选择加密方式。
+- Reality 需要填写 SNI / 握手域名，可以直接输入，也可以选 2（按本机出口地区扫描）、3（按分类扫描）或 4（自定义列表扫描），脚本会在本机逐个验证 TLS 1.3 / X25519 / 证书 / HTTP/2 后列出可用项（见“Reality SNI 扫描”）；Hysteria2、TUIC、AnyTLS、Trojan 需要填写证书使用的域名或 IP（默认就是上一步的服务器地址），并可选择自签证书或使用已有证书；Shadowsocks 需要选择加密方式；Argo 需要选择快速隧道或命名隧道。
 - Telegram SOCKS5 会生成随机用户名和密码，并输出 Telegram 官方 `https://t.me/socks?...` 与 `tg://socks?...` 一键添加链接，同时保留手动参数。
 - 脚本先备份当前配置，再写入新节点并用 `sing-box check` 校验。校验失败会自动恢复最近一次备份；通过则重启服务。
 - 屏幕上会显示节点参数、分享链接或手动配置字段，参数同时保存在 `/etc/sing-box/manager/<节点名>.json`。之后随时可以用菜单 8 或 `sb links` 再看。
@@ -174,6 +185,110 @@ sb host
 ```
 
 IPv6 地址会自动在链接里加上方括号，例如 `vless://...@[2001:db8::1]:443`。
+
+## 非交互命令（脚本化部署）
+
+每个添加流程都有对应的命令行写法，加上 `-y` 就不会再问任何问题，没给的参数一律用默认值（节点名、端口、自签证书、自签名 SNI 等都是自动生成/自动选择）。
+
+```bash
+sb add reality --port 443 --sni auto -y
+sb add trojan --domain vps.example.com --self-signed -y
+sb add hy2 --port 8443 -y
+sb add tuic --port 9443 -y
+sb add anytls --port 10443 --fps chrome,firefox -y
+sb add ss --port 11443 --method aes-256-gcm -y
+sb add vmess --port 10086 -y
+sb add argo --proto vmess --quick -y
+sb add argo --proto vless --token <TOKEN> --domain argo.example.com -y
+sb install -y
+```
+
+`sb add <协议>` 的协议名可以用 `reality`、`hy2`、`tuic`、`anytls`、`trojan`、`ss`、`vmess`、`argo`，也支持 `tg` 和 `xray`。`sb add` 不带协议时会打开原来的选择列表。
+
+| 选项 | 作用 |
+| --- | --- |
+| `-y` / `--yes` / `--non-interactive` | 完全不提问，未给的参数用默认值 |
+| `--tag` / `--name 名称` | 节点名（默认自动生成，如 `reality-1`） |
+| `--port 端口` | 端口（默认自动选一个空闲端口） |
+| `--sni 域名` / `--sni auto` | Reality 的 SNI；`auto` 先按出口地区扫描，再自动用最快的那个 |
+| `--fps chrome,firefox` / `--fps all` | 客户端 TLS 指纹（Reality / AnyTLS） |
+| `--method aes-256-gcm` | Shadowsocks 加密方式 |
+| `--domain 域名` | TLS 协议的证书域名/IP（Trojan、Hysteria2、TUIC、AnyTLS）或 Argo 命名隧道的公网域名 |
+| `--self-signed` | 显式指定用自签证书（默认行为） |
+| `--cert cert.pem --key privkey.pem` | 用已有证书（例如 acme.sh / Let's Encrypt），此时分享链接不带 `insecure` |
+| `--proto vmess` / `--proto vless` | Argo 节点本机入站用哪种 WebSocket 协议 |
+| `--quick` / `--token <TOKEN>` | Argo 快速隧道 / 命名隧道 |
+| `--path /argo-xxx` | Argo 的 WebSocket 路径 |
+| `--tg-push` | 这个节点创建后直接把分享链接推送到 Telegram（需先 `sb tg config`） |
+| `--region JP` / `--category dev` / `--list a.com,b.com` / `--file 列表.txt` | SNI 扫描的候选来源 |
+| `--auto` | SNI 扫描后直接输出最快的域名 |
+| `--parallel 1-32` | SNI 扫描并发数（默认 6） |
+
+不加 `-y` 而直接给几个参数也可以（例如 `sb add trojan --port 2087`），只会在真正缺值的环节提问。
+
+## Reality SNI 扫描
+
+Reality 的 SNI / 握手域名是一个“伪装目标”，它需要支持 TLS 1.3、X25519 密钥交换、HTTP/2，并持有有效证书；否则客户端握手失败或特征不对。菜单 **29** 或 `sb scan-sni` 可以扫描并逐个验证候选域名。
+
+```bash
+sb scan-sni                       # 按本机出口地区选候选并验证
+sb scan-sni --region JP           # 指定地区（US/JP/SG/HK/KR/DE/GB/FR/NL/TW/CA/AU/RU/IN/BR 等）
+sb scan-sni --category dev        # 按分类：big-tech / cdn / dev / media / ecom / all
+sb scan-sni --list "www.bing.com,github.com"
+sb scan-sni --file ~/sni.txt      # 一行一个域名，支持逗号/空格分隔
+sb scan-sni --region JP --auto    # 只输出最快的一个，便于脚本使用
+```
+
+三种模式：
+
+- **按 VPS 出口地区**：先用 `api.country.is`、`ipinfo.io`、`ifconfig.co` 等识别本机出口 IP 的国家代码，再用该地区的候选列表（含当地常见站点）+ 通用大厂/CDN/开发类域名。识别失败时用通用列表，也可以用 `--region` 手动指定。
+- **按分类**：`big-tech`（大厂/CDN）、`cdn`、`dev`（开发/代码托管）、`media`（流媒体）、`ecom`（电商/区域站点）。
+- **自定义列表**：`--list` 直接给域名，`--file` 读文件。
+
+验证方式是**在你这台 VPS 上**对每个域名做一次真实握手：
+
+```bash
+openssl s_client -connect 域名:443 -servername 域名 -tls1_3 -groups X25519 -alpn h2 \
+  -showcerts -verify_hostname 域名 -CAfile <系统 CA 包>
+```
+
+判定条件：协商结果为 `TLSv1.3`、只协商 X25519 时握手成功（TLS 1.3 下 `s_client` 不再打印 `Server Temp Key`，所以用 `-groups X25519` 强制验证）、ALPN 为 `h2`、证书链校验返回 `0 (ok)` 且域名匹配（`-verify_hostname`），并额外检查证书是否将在 30 天内过期。表格按握手延迟排序，标出 PASS/FAIL 和未通过的原因（无 HTTP/2、无 X25519、证书已过期、握手失败等），结果同时存到 `/etc/sing-box/manager/sni-scan.json`。
+
+添加 Reality 节点时，SNI 的选项里也可以直接选扫描模式；完全非交互时用 `--sni auto`。扫描结果只代表**这台 VPS** 到该域名的网络与 TLS 能力：客户端所在网络是否同样可访问该域名，需要你自己判断；候选列表也不是“不会被阻断”的保证，请按实际线路挑选。
+
+## Trojan 节点与自签证书
+
+菜单 **27**，或 `sb trojan` / `sb add trojan`。Trojan 入站是 TLS + 密码（TCP），因此必须有证书。
+
+- 默认给每个节点生成独立的 RSA 2048 自签证书，存放在 `/etc/sing-box/certs/<节点名>.crt` 和 `.key`（私钥 600，证书 644，CN 和 SAN 都写成节点域名/IP，有效期 825 天）。这样多个节点用不同域名时不会互相串证书。
+- 想用 Let's Encrypt / acme.sh 的证书：加 `--cert /path/fullchain.pem --key /path/privkey.pem`（交互模式下选“2) 已有证书文件”）。此时分享链接**不带** `insecure`，客户端会正常校验证书，所以域名必须和证书匹配、并解析到这台机器。
+- 自签时 Hysteria2、TUIC、AnyTLS、Trojan 的分享链接会分别带 `insecure=1` / `allow_insecure=1` / `allowInsecure=1`，`sni` 也一并写入；换成受信任证书后这些参数会自动去掉。
+- 老版本创建的节点（共用 `server.crt`）不受影响，配置里仍然指向原路径；新节点不再新建共享证书。
+
+## Argo（Cloudflare Tunnel）节点
+
+菜单 **28**，或 `sb argo add` / `sb add argo`。脚本会：
+
+1. 从 Cloudflare 官方 GitHub Releases 下载对应架构的 `cloudflared` 到 `/usr/local/bin/cloudflared`（已存在且能运行时直接复用，不会覆盖其他程序）。
+2. 在本机建一个**只监听 `127.0.0.1`** 的 WebSocket 入站（默认 VMess，也可 `--proto vless`），路径随机生成（如 `/argo-a1b2c3`）。
+3. 把 `cloudflared` 装成 systemd / OpenRC 服务 `cloudflared-<节点名>`，开机自启、自动重启。
+4. 生成 VMess（`net=ws`、`tls=tls`、`host`/`sni` 为隧道域名）或 VLESS WS 分享链接，端口 443。
+
+两种隧道：
+
+- **快速隧道（`--quick`）**：走 `trycloudflare.com` 临时域名，不需要 Cloudflare 账号，也没有可用性保证。**域名会在 cloudflared 重启后变化**，变了以后运行 `sb argo url <节点名>` 重新读取并刷新分享链接。
+- **命名隧道（`--token <TOKEN> --domain <域名>`）**：在 Cloudflare Zero Trust → Networks → Tunnels 创建隧道，复制 Token，并在该隧道的 Public Hostname 里把域名指向 `http://127.0.0.1:<本机端口>`（路径用脚本显示的 `/argo-xxxx`）。域名固定，适合长期使用。Token 保存在 `/etc/sing-box/manager/argo/<节点名>.token`（600），不会出现在进程参数里。
+
+常用命令：
+
+```bash
+sb argo list                 # 列出 Argo 节点、域名和分享链接
+sb argo url argo-1           # 快速隧道换域名后刷新
+sb argo log argo-1           # 查看 cloudflared 日志
+sb argo remove argo-1        # 删除节点、服务、Token 和记录
+```
+
+Argo 节点的本机端口不需要对公网放行；只有 `cloudflared` 需要能出站访问 Cloudflare（TCP/UDP 443）。脚本不修改防火墙。
 
 ## TLS 指纹（多指纹分享链接）
 
@@ -281,10 +396,11 @@ sb relay add
 
 操作流程：
 
-- **粘贴落地节点的分享链接**。支持 `vless://`（Reality / TLS / 无加密，tcp / ws / grpc / http / httpupgrade）、VMess TCP `vmess://`、`hysteria2://` 或 `hy2://`、`tuic://`、`anytls://`、`ss://`，本脚本生成的链接都能直接用。在落地机上运行 `sb links` 就能看到它的链接。
-- 没有链接时直接回车，改为**手动填写**：选择落地协议，再填地址、端口、UUID / 密码等。
-- 落地是 TCP 协议（VLESS、VMess、AnyTLS、Shadowsocks）时，脚本会测试从中转机能不能连上落地端口，连不上只提示，不会阻止添加。
-- 选择**中转入口协议**（客户端连接中转机用的协议，1-5，和添加普通节点一样），填写名称和端口。名称默认是 `relay-reality-1`、`relay-hy2-1` 这样的格式。
+- **粘贴落地节点的分享链接**。支持 `vless://`（Reality / TLS / 无加密，tcp / ws / grpc / http / httpupgrade）、`vmess://`（TCP，或 Argo / CDN 那种 WebSocket + TLS）、`trojan://`（tcp / ws / grpc）、`hysteria2://` 或 `hy2://`、`tuic://`、`anytls://`、`ss://`，本脚本生成的链接都能直接用。在落地机上运行 `sb links` 就能看到它的链接。
+- 没有链接时直接回车，改为**手动填写**：选择落地协议（新增 Trojan 和 VMess + WS/TLS），再填地址、端口、UUID / 密码等。
+- 落地是 TCP 协议（VLESS、VMess、Trojan、AnyTLS、Shadowsocks）时，脚本会测试从中转机能不能连上落地端口，连不上只提示，不会阻止添加。
+- 选择**中转入口协议**（客户端连接中转机用的协议，1-8：VLESS Reality、Hysteria2、TUIC、AnyTLS、Shadowsocks、Trojan、VMess TCP、Argo，和添加普通节点一样），填写名称和端口。名称默认是 `relay-reality-1`、`relay-hy2-1` 这样的格式。
+- **所有节点类型都能当入口，也都能当落地**：入口就是普通节点（含 Trojan、VMess、Argo），落地就是普通出站（含 Trojan、VMess WS+TLS）。
 - 脚本先备份配置，再添加入口、落地出站和只针对这个入口的路由规则，用 `sing-box check` 校验，失败自动恢复。
 - 屏幕上会显示**给客户端用的分享链接**，地址是中转机的公网 IP。客户端导入这个链接即可。
 
@@ -297,7 +413,7 @@ sb relay forward
 ```
 
 - 目标可以填 `地址:端口`（例如 `1.2.3.4:443`，IPv6 写成 `[2001:db8::1]:443`），也可以**直接粘贴落地节点的分享链接**。
-- 选择转发协议 `tcp`、`udp` 或 `both`。粘贴链接时会自动给出默认值：Hysteria2 / TUIC 用 `udp`，VLESS / AnyTLS 用 `tcp`，Shadowsocks 用 `both`。
+- 选择转发协议 `tcp`、`udp` 或 `both`。粘贴链接时会自动给出默认值：Hysteria2 / TUIC 用 `udp`，VLESS / AnyTLS / Trojan 用 `tcp`，Shadowsocks 用 `both`。
 - 本机监听端口默认和目标端口相同（被占用时自动换一个空闲端口）。
 - 粘贴的是分享链接时，脚本会生成**换成中转机地址和端口的新链接**，客户端直接导入；填的是 `地址:端口` 时，客户端使用落地节点原来的配置，只把地址和端口改成中转机的。
 
@@ -323,14 +439,89 @@ sb relay del
 
 记得在中转机的防火墙放行入口端口：中转按入口协议放行（见“防火墙”），端口转发按添加时选择的 `tcp` / `udp` / `both` 放行。落地机上对应的端口也要允许中转机访问。
 
+## Telegram 机器人（推送与远程管理）
+
+机器人可以做两件事：把节点分享链接**主动推送到 Telegram**，以及常驻后台，让你在手机上用命令**查看节点、新建、删除、跑 SNI 扫描**。
+
+### 1. 配置
+
+1. 在 Telegram 找 [@BotFather](https://t.me/BotFather)，`/newbot` 建一个机器人，拿到形如 `123456789:AAF...` 的 Token。
+2. 先给机器人发一条 `/start`（否则机器人不能主动给你发消息）。
+3. 在服务器上配置：
+
+```bash
+sb tg config
+```
+
+它会依次问 Token、允许的 chat_id 和“新节点自动推送”；也可以一条命令写完：
+
+```bash
+sb tg config --token '123456789:AAF...' --chat-id '123456789' --auto-push
+```
+
+不知道自己的 chat_id：先给机器人发一条消息，再运行 `sb tg id`，它会把最近的 chat_id 列出来。配好后运行 `sb tg test`，应该能在 Telegram 里收到一条测试消息。
+
+配置保存在 `/etc/sing-box/manager/tgbot.conf`（权限 600）。`TG_CHAT_ID` 支持用逗号分隔多个 id（例如自己 + 一个私有群）。
+
+### 2. 推送分享链接
+
+```bash
+sb tg push               # 推送全部节点的分享链接
+sb tg push reality-1     # 只推送一个节点
+```
+
+菜单 **31** 也是同一个动作。配置了 `--auto-push`（`TG_AUTO_PUSH=1`）后，**每次新建 sing-box 节点**（菜单、`sb add`、批量添加）都会自动把该节点的分享链接发到 Telegram；机器人里的 `/add` 会直接把链接回复在对话里，不重复推送。`sb tg config` 交互配置时可以随时开关。内容过长时自动分成多条消息，超过 12000 字符则改发 `.txt` 文件。
+
+### 3. 常驻机器人与远程管理
+
+```bash
+sb tg enable      # 安装并启动 systemd / OpenRC 服务 sing-box-tgbot，开机自启
+sb tg status      # 配置 + 服务状态
+sb tg logs        # 最近日志
+sb tg stop        # 只停止（保留服务文件）
+sb tg disable     # 停止并移除服务文件与开机自启
+```
+
+机器人用长轮询（`getUpdates`）工作，不需要公网 IP、域名或开放端口。它**只接受 `TG_CHAT_ID` 里列出的会话**，其他 chat_id 发来命令只会收到一条“未授权”提示。
+
+| 命令 | 作用 |
+| --- | --- |
+| `/start`、`/help` | 命令列表 |
+| `/status` | sing-box 版本、服务状态、监听端口 |
+| `/list` | 节点列表 |
+| `/links [名称]`、`/push [名称]` | 全部（或指定节点）的分享链接 |
+| `/add <协议> [--选项]` | 新建节点，例如 `/add trojan --port 2087`、`/add reality --sni auto`、`/add hy2` |
+| `/del 名称` | 删除节点 |
+| `/scan [JP\|dev]` | Reality SNI 扫描（地区代码或分类） |
+| `/argo list`、`/argo url 名称` | Argo 隧道节点 |
+| `/id`、`/ping` | 当前 chat_id、连通性 |
+
+注意：
+
+- 机器人以 **root** 运行，命令等同于服务器上的 `sb`，只能在**自己的私聊或私有群**里用；不要把机器人拉进公开群。
+- Token 等同于机器人的密码，配置文件是 600；机器人调用 Telegram API 时，Token 和消息内容都放在临时 curl 配置文件里，不出现在 `ps` 的进程参数中。
+- 机器人的 `/add` 是非交互模式：没给的参数用默认值（自动选端口、自签证书等）。想指定就带上和 `sb add` 一样的选项。
+- 用其他程序（比如一份手动运行的 `sb tg poll`）跑同一个机器人会抢 `getUpdates`，脚本会用 `$DATA/.tgbot.lock` 阻止重复启动，报 409 时应先 `sb tg stop`。
+
 ## 命令一览
 
 | 命令 | 作用 |
 | --- | --- |
 | `sb` | 打开管理菜单 |
 | `sb5` | 直接添加 Shadowsocks 节点；也可运行 `sb 5`、`sb ss` 或 `sb add-ss` |
-| `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto） |
+| `sb tg` | 添加 Telegram SOCKS5 节点（不支持 MTProto，保持原来的用法） |
 | `sb vmess` / `sb add-vmess` | 添加 VMess AEAD/TCP 直连节点（默认端口 `10086`） |
+| `sb trojan` / `sb add-trojan` | 添加 Trojan 节点（TLS + 密码，默认端口 `20443`） |
+| `sb add <协议> [--选项] -y` | 非交互添加节点：`reality`、`hy2`、`tuic`、`anytls`、`trojan`、`ss`、`vmess`、`argo`、`tg`、`xray`；`--sni auto` 会先扫描再选最快的 SNI |
+| `sb argo add` | 添加 Argo（Cloudflare Tunnel）节点，`--quick` 快速隧道或 `--token` 命名隧道 |
+| `sb argo list` / `url 名称` | 列出 Argo 节点，或快速隧道换域名后刷新分享链接 |
+| `sb argo log` / `remove 名称` | 查看 cloudflared 日志，或删除 Argo 节点及其服务 |
+| `sb scan-sni [--region JP\|--category dev\|--list a.com,b.com\|--auto]` | Reality SNI 扫描，验证 TLS 1.3 / X25519 / 证书 / HTTP/2 并按延迟排序 |
+| `sb tg config` | 配置 Telegram 机器人的 Token / chat_id / 自动推送 |
+| `sb tg test` / `sb tg id` | 发送测试消息；读取给机器人发过消息的 chat_id |
+| `sb tg push [名称]` | 推送全部（或指定节点）分享链接到 Telegram |
+| `sb tg enable` / `start` / `stop` / `restart` | 安装并启停常驻机器人服务（systemd / OpenRC，服务名 `sing-box-tgbot`） |
+| `sb tg status` / `logs` / `disable` | 机器人状态、日志，停用并移除服务文件 |
 | `sb add-all` | 逐项新增全部 8 类节点，最后输出 v2rayNG 与 NekoBox/sing-box 两组 Base64 内容 |
 | `sb bbr` | 自动选择内核支持的标准 TCP BBR；确认后应用并持久化 |
 | `sb bbr status` / `sb bbr reset` | 查看 BBR 状态，或恢复修改前的拥塞控制算法 |
@@ -424,6 +615,8 @@ chmod +x singbox-manager.sh
 sb links
 ```
 
+从 `2026.11.20.1` 之前的版本升级时：原有菜单项、编号和 `sb` 子命令都不变，只是多出菜单 **27–31**（Trojan、Argo、SNI 扫描、Telegram 机器人）和 `sb add` / `sb argo` / `sb scan-sni` / `sb tg` 的新子命令。旧节点（包括旧的共享自签证书）不受影响；新增的 Hysteria2 / TUIC / AnyTLS / Trojan 节点会改用各自的证书文件。不需要也不应该重启已有节点。
+
 ## 已装过其他 sing-box 脚本
 
 ### 旧脚本已经删掉，只剩残留：自动清理
@@ -497,9 +690,10 @@ systemctl disable --now caddy
 
 脚本**不会**自动修改防火墙，你需要只放行实际使用的端口：
 
-- Reality / VMess / AnyTLS / Shadowsocks / Telegram SOCKS5 / Xray VLESS + TLS：TCP
+- Reality / VMess / AnyTLS / Shadowsocks / Telegram SOCKS5 / Trojan / Xray VLESS + TLS：TCP
 - Hysteria2 / TUIC：UDP
 - 端口转发：按添加时选择的 `tcp` / `udp` / `both` 放行
+- Argo：本机 WebSocket 入站只监听 `127.0.0.1`，不用对外放行；只要本机可出站访问 Cloudflare
 
 使用 UFW 时的示例（按你实际的节点端口修改）：
 
@@ -527,7 +721,11 @@ nft list ruleset
 ## 注意事项
 
 - **官方示例节点**：sing-box 官方安装包（deb 和 apk 都一样）会附带一个示例配置，里面有一个监听 8080 端口的 Shadowsocks 节点，密码是公开的。本脚本在安装和打开菜单时会先备份配置，再把这个示例节点移除。
-- **自签证书**：Hysteria2、TUIC、AnyTLS 共用一张自签证书（`/etc/sing-box/certs/`，RSA 2048，有效期 825 天），只在第一次需要时生成。客户端需要开启“允许不安全证书 / insecure”，分享链接里已经带上这个参数。
+- **自签证书**：Hysteria2、TUIC、AnyTLS、Trojan 每次添加节点时**各生成一张独立的自签证书**（`/etc/sing-box/certs/<节点名>.crt|.key`，RSA 2048，CN/SAN 为节点域名或 IP，有效期 825 天）。客户端需要开启“允许不安全证书 / insecure”，分享链接里已经带上这个参数。想用受信任证书（例如 acme.sh / Let's Encrypt）就加 `--cert/--key`，链接会自动去掉 `insecure`。
+- **旧版共享证书**：早于本版本创建的 Hysteria2 / TUIC / AnyTLS 节点仍指向 `/etc/sing-box/certs/server.crt`，脚本不会改动或删除它；新节点不再使用共享证书。
+- **Trojan**：入站依赖 TLS，必须配证书；删节点时不会自动删除证书文件（防止误删复用的证书）。
+- **Argo / cloudflared**：内核从 Cloudflare 官方 GitHub Releases 下载到 `/usr/local/bin/cloudflared`，每个节点一个服务 `cloudflared-<节点名>`。快速隧道的 `trycloudflare.com` 域名无可用性保证、重启会变（用 `sb argo url <名称>` 刷新）；命名隧道的域名和回源规则在 Cloudflare 后台配置，脚本只负责本机部分。
+- **Telegram 机器人**：Token 和 chat_id 存在 `/etc/sing-box/manager/tgbot.conf`（600），机器人以 root 运行，等同服务器 `sb` 权限；只用在自己的私聊或私有群，并只把 chat_id 填给信任的人。
 - **Xray 自签证书**：每个 Xray VLESS + TLS 节点独立生成 RSA 2048 自签证书（有效期 825 天），并在链接中使用 `pcs` 做 SHA-256 pin；不使用 `allowInsecure`。
 - **Xray sidecar 文件**：二进制 `/usr/local/bin/singbox-xray`，配置 `/etc/singbox-xray/config.json`，服务名 `singbox-xray`，证书与节点元数据存放在 `/etc/singbox-xray/`。这些路径与本脚本的 sing-box 配置相互独立。
 - **AnyTLS 链接格式**：不同客户端对 `anytls://` 链接的参数要求可能不一样，导入前请对照客户端文档。
@@ -543,7 +741,15 @@ nft list ruleset
 | `/etc/sing-box/config.json` | sing-box 主配置 |
 | `/etc/sing-box/manager/` | 节点凭据和服务器地址（`server-host`） |
 | `/etc/sing-box/manager/relays/` | 中转和端口转发记录 |
-| `/etc/sing-box/certs/` | 自签证书 |
+| `/etc/sing-box/certs/` | 自签证书（每个 TLS 节点一个 `<节点名>.crt/.key`；旧节点用 `server.crt`） |
+| `/etc/sing-box/manager/sni-scan.json` | 最近一次 Reality SNI 扫描结果 |
+| `/etc/sing-box/manager/argo/` | Argo 节点记录与命名隧道 Token（root only） |
+| `/usr/local/bin/cloudflared` | Argo 隧道内核（首次添加 Argo 节点时下载） |
+| `/etc/systemd/system/cloudflared-<节点名>.service` / `/etc/init.d/cloudflared-<节点名>` | 每个 Argo 节点的隧道服务 |
+| `/var/log/cloudflared-<节点名>.log` | Argo 隧道日志（快速隧道域名也在这里，可用 `sb argo url` 刷新） |
+| `/etc/sing-box/manager/tgbot.conf` | Telegram 机器人 Token / chat_id / 自动推送开关（600） |
+| `/etc/systemd/system/sing-box-tgbot.service` / `/etc/init.d/sing-box-tgbot` | Telegram 机器人服务（仅 `sb tg enable` 后创建） |
+| `/var/log/sing-box-tgbot.log` / `journalctl -u sing-box-tgbot` | Telegram 机器人日志 |
 | `/var/backups/sing-box-manager/` | 配置备份 |
 | `/etc/systemd/system/sing-box.service` | Debian / Ubuntu / AlmaLinux：systemd 服务（只在官方安装包没有提供时才由脚本创建） |
 | `/etc/init.d/sing-box` | Alpine：OpenRC 服务（优先使用官方 apk 包自带的，没有时由脚本创建） |
@@ -572,6 +778,15 @@ sb status
 sb xray status
 sb xray log
 sb xray check
+```
+
+查看 Argo 隧道和 Telegram 机器人：
+
+```bash
+sb argo list
+sb argo log argo-1
+sb tg status
+sb tg logs
 ```
 
 ```bash
