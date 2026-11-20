@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.9"
+SCRIPT_VERSION="2026.11.20.10"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -160,8 +160,11 @@ prompt() { local __var="$1" __label="$2" __default="${3:-}"; local __v; if [[ -n
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
 valid_tag() {
   local t="$1"
-  [[ -n "$t" && ${#t} -le 60 && "$t" != .* && "$t" != -* && ! "$t" =~ [/\\[:space:][:cntrl:]] ]] ||
-    die "节点名称不能为空，不能包含斜杠、空格或控制字符，也不能以 . 或 - 开头（最长 60 字符）"
+  [[ -n "${t//[[:space:]]/}" && ${#t} -le 60 ]] || die "节点名称不能为空，且最长 60 字符"
+  case "$t" in
+    .*|-*|*/*|*\\*|*$'\n'*|*$'\r'*|*$'\t'*)
+      die "节点名称不能包含斜杠、反斜杠或换行，也不能以 . 或 - 开头" ;;
+  esac
 }
 
 # ---------- 非交互参数 ----------
