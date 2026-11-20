@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.10"
+SCRIPT_VERSION="2026.11.20.11"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -156,7 +156,7 @@ svc_daemon_reload() { if [[ "$INIT_SYS" == systemd ]]; then systemctl daemon-rel
 pause() { read -r -p "按回车继续..." _ || true; }
 random_hex() { openssl rand -hex "${1:-8}"; }
 new_uuid() { "$SB" generate uuid; }
-prompt() { local __var="$1" __label="$2" __default="${3:-}"; local __v; if [[ -n "$__default" ]]; then read -r -p "$__label [$__default]: " __v; __v="${__v:-$__default}"; else read -r -p "$__label: " __v; fi; printf -v "$__var" '%s' "$__v"; }
+prompt() { local __p_var="$1" __p_label="$2" __p_default="${3:-}" __p_val=""; if [[ -n "$__p_default" ]]; then read -r -p "$__p_label [$__p_default]: " __p_val || true; __p_val="${__p_val:-$__p_default}"; else read -r -p "$__p_label: " __p_val || true; fi; printf -v "$__p_var" '%s' "$__p_val"; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
 valid_tag() {
   local t="$1"
@@ -214,13 +214,13 @@ parse_opts() {
 }
 ask_value() {
   # $1 变量名；$2 提示文字；$3 默认值；其余参数为可接受的选项名（如 port listen-port）
-  local __name="$1" __label="$2" __def="$3" __v
+  local __av_name="$1" __av_label="$2" __av_def="$3" __av_val=""
   shift 3
-  __v="$(optv "$@")"
-  if [[ -z "$__v" ]]; then
-    if (( NONINT )); then __v="$__def"; else prompt __v "$__label" "$__def"; fi
+  __av_val="$(optv "$@")"
+  if [[ -z "$__av_val" ]]; then
+    if (( NONINT )); then __av_val="$__av_def"; else prompt __av_val "$__av_label" "$__av_def"; fi
   fi
-  printf -v "$__name" '%s' "$__v"
+  printf -v "$__av_name" '%s' "$__av_val"
 }
 ask_port() {
   # $1 变量名；$2 提示文字；$3 默认端口；$4 tcp / udp / both
