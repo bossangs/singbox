@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.12"
+SCRIPT_VERSION="2026.11.20.13"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -4457,54 +4457,41 @@ cmd_bbr_status() {
   echo "默认队列规则未由管理器修改。"
 }
 cmd_bbr_apply() {
-  local available current previous init_saved state_created=0 module_file sysctl_file answer
+  local conf="/etc/sysctl.d/99-custom.conf"
   need_root
-  [[ -r "$BBR_CC_FILE" && -r "$BBR_AVAILABLE_FILE" ]] || { echo "内核未提供 TCP 拥塞控制接口；未作修改。"; return 0; }
-  available="$(cat "$BBR_AVAILABLE_FILE")"
-  if ! grep -qw -- bbr <<<"$available"; then
-    echo "内核当前未注册标准 TCP BBR（bbr）；没有修改任何设置。"
-    echo "内核已注册算法：${available:-（无）}"
-    if grep -Eqw 'bbr2|bbr3' <<<"$available"; then echo "检测到非标准/定制 BBR 变体；自动模式不会擅自启用。"; fi
-    return 0
+  mkdir -p /etc/sysctl.d
+  cat >"$conf" <<'EOF'
+fs.file-max = 6815744
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_rfc1337=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_adv_win_scale=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.ipv4.tcp_ecn=2
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_rmem=8192 174760 67108864
+net.ipv4.tcp_wmem=8192 174760 67108864
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.route_localnet=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+  chmod 644 "$conf"
+  if ! sysctl --system; then
+    sysctl -p "$conf" || die "执行 sysctl 应用配置失败"
   fi
-  [[ "$INIT_SYS" == systemd || "$INIT_SYS" == openrc ]] || { echo "未识别 systemd/OpenRC；无法安全配置开机持久化。"; return 0; }
-  current="$(cat "$BBR_CC_FILE")"
-  if [[ -e "$BBR_STATE" ]]; then
-    bbr_state_valid || { echo "BBR 状态文件存在但标记无效：$BBR_STATE"; return 0; }
-    init_saved="$(bbr_state_value init)"
-    [[ "$init_saved" == "$INIT_SYS" ]] || { echo "系统 init 与上次 BBR 设置不一致；请先使用原 init 环境执行 sb bbr reset。"; return 0; }
-  else
-    previous="$current"
-  fi
-  bbr_set_paths "$INIT_SYS" || { echo "无法确定 sysctl 配置位置。"; return 0; }
-  sysctl_file="$BBR_SYSCTL_FILE"; module_file="$BBR_MODULES_FILE"
-  echo "自动选择：内核已注册标准算法 bbr。"
-  echo "当前算法：$current"
-  echo "将把 tcp_congestion_control 设为 bbr，并写入开机配置：$sysctl_file"
-  echo "将登记 tcp_bbr 模块以便启动时可用：$module_file"
-  echo "不会修改队列规则、其他 sysctl、防火墙或 sing-box/Xray 服务。"
-  if ! read -r -p "确认应用这项系统级 TCP 设置？[y/N]: " answer || [[ ! "${answer,,}" =~ ^(y|yes)$ ]]; then
-    echo "已取消，系统设置未更改。"; return 0
-  fi
-  if ! bbr_state_valid; then
-    bbr_write_state "$previous" "$INIT_SYS" || { echo "无法保存原算法状态；未继续。"; return 0; }
-    state_created=1
-  fi
-  if ! bbr_write_block "$module_file" "tcp_bbr"; then
-    (( state_created )) && rm -f -- "$BBR_STATE"
-    echo "无法写入模块加载配置；未继续。"; return 0
-  fi
-  if ! bbr_write_block "$sysctl_file" "net.ipv4.tcp_congestion_control = bbr"; then
-    if (( state_created )); then bbr_remove_block "$module_file" || true; rm -f -- "$BBR_STATE"; fi
-    echo "无法写入 sysctl 配置；未继续。"; return 0
-  fi
-  if ! printf '%s\n' bbr >"$BBR_CC_FILE"; then
-    if (( state_created )); then
-      bbr_remove_block "$sysctl_file" || true; bbr_remove_block "$module_file" || true; rm -f -- "$BBR_STATE"
-    fi
-    echo "无法应用运行时算法；请检查内核权限和状态文件。"; return 0
-  fi
-  echo "TCP 拥塞控制已切换为 bbr，并已写入开机配置。运行 sb bbr status 查看，运行 sb bbr reset 恢复原算法。"
+  echo "已写入 $conf 并执行 sysctl --system 生效。"
+  echo "当前拥塞控制：$(cat "$BBR_CC_FILE" 2>/dev/null || sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)"
+  echo "当前队列规则：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)"
 }
 cmd_bbr_reset() {
   local previous saved_init available current answer
@@ -5033,7 +5020,7 @@ menu() {
     echo "19) 修改节点端口"
     echo "20) 添加本机 VLESS + TLS 入站（域名连接；Xray；默认 XHTTP auto）"
     echo "21) 批量添加全部 8 类节点并输出 v2rayNG / NekoBox 两组 Base64"
-    echo "22) 自动选择并启用服务器 TCP BBR（需要确认）"
+    echo "22) 启用 TCP BBR 与内核网络优化（直接写入 /etc/sysctl.d/99-custom.conf）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
     echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
     echo "25) 查看 sing-box 入/出累计流量"
