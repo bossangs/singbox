@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.20.2"
+SCRIPT_VERSION="2026.11.20.3"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1786,15 +1786,15 @@ parse_fps() {
     if valid_fp "$t"; then :
     elif [[ "$t" =~ ^[0-9]+$ ]] && (( 10#$t >= 1 && 10#$t <= ${#FP_LIST[@]} )); then t="${FP_LIST[$((10#$t - 1))]}"
     else echo "不认识的指纹：$t（可选：${FP_LIST[*]}，或 all）" >&2; return 1; fi
-    seen=0; for x in "${res[@]}"; do [[ "$x" == "$t" ]] && seen=1; done
+    seen=0; for x in "${res[@]+"${res[@]}"}"; do [[ "$x" == "$t" ]] && seen=1; done
     (( seen )) || res+=("$t")
   done
   if [[ "$mode" == reality ]]; then
     local keep=()
-    for x in "${res[@]}"; do
+    for x in "${res[@]+"${res[@]}"}"; do
       if [[ " $REALITY_BAD_FP " == *" $x "* ]]; then skipped+="$x "; else keep+=("$x"); fi
     done
-    res=("${keep[@]}")
+    res=("${keep[@]+"${keep[@]}"}")
     [[ -z "$skipped" || "$in" == *all* || "$in" == *全部* ]] ||
       echo "提示：Reality 不支持 ${skipped% } 指纹（缺少 TLS 1.3 的 X25519 密钥交换，客户端会连不上），已跳过。" >&2
   fi
