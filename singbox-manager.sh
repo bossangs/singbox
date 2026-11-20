@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.6"
+SCRIPT_VERSION="2026.11.20.7"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1891,22 +1891,23 @@ sni_cat() {
 }
 sni_categories() { echo "big-tech cdn dev media ecom all"; }
 sni_region_extra() {
+  # 优先放各地区大厂/硬件/企业官网（通常中国大陆也可正常 TLS 握手，避免境外新闻站被阻断）
   case "${1^^}" in
-    US) echo "www.verizon.com www.walmart.com www.usps.com" ;;
-    JP) echo "www.yahoo.co.jp www.rakuten.co.jp www.sony.jp www.nicovideo.jp" ;;
-    SG) echo "www.shopee.sg www.straitstimes.com www.dbs.com.sg" ;;
-    HK) echo "www.hk01.com www.openrice.com www.hktvmall.com" ;;
-    KR) echo "www.naver.com www.daum.net www.coupang.com" ;;
-    DE) echo "www.spiegel.de www.heise.de www.deutschebahn.com" ;;
-    GB) echo "www.bbc.co.uk www.theguardian.com www.gov.uk" ;;
-    FR) echo "www.lemonde.fr www.orange.fr www.fnac.com" ;;
-    NL) echo "www.nu.nl www.bol.com" ;;
-    TW) echo "www.pchome.com.tw www.books.com.tw" ;;
-    CA) echo "www.cbc.ca www.canada.ca" ;;
-    AU) echo "www.abc.net.au www.seek.com.au" ;;
-    RU) echo "www.yandex.ru www.ozon.ru" ;;
-    IN) echo "www.flipkart.com www.indiatimes.com" ;;
-    BR) echo "www.globo.com www.uol.com.br" ;;
+    US) echo "www.intel.com www.nvidia.com www.amd.com www.cisco.com www.oracle.com www.dell.com" ;;
+    JP) echo "www.sony.jp www.sony.com www.canon.jp www.nintendo.co.jp" ;;
+    SG) echo "www.dbs.com.sg www.singtel.com www.lazada.sg" ;;
+    HK) echo "www.cathaypacific.com www.hsbc.com.hk" ;;
+    KR) echo "www.samsung.com www.lg.com" ;;
+    DE) echo "www.sap.com www.siemens.com www.bmw.com" ;;
+    GB) echo "www.arm.com www.hsbc.co.uk" ;;
+    FR) echo "www.airbus.com www.loreal.com" ;;
+    NL) echo "www.philips.com www.asml.com" ;;
+    TW) echo "www.asus.com www.acer.com www.tsmc.com" ;;
+    CA) echo "www.shopify.com www.blackberry.com" ;;
+    AU) echo "www.atlassian.com www.canva.com" ;;
+    RU) echo "www.kaspersky.com www.yandex.ru" ;;
+    IN) echo "www.tcs.com www.infosys.com" ;;
+    BR) echo "www.mercadolivre.com.br www.nubank.com.br" ;;
     *) echo "" ;;
   esac
 }
@@ -2078,7 +2079,7 @@ sni_collect() {
     else
       echo "没能识别本机出口地区，改用通用候选列表。" >&2
     fi
-    { sni_cat big-tech; sni_cat cdn; sni_cat dev; sni_region_extra "$SNI_REGION"; } | tr ' ' '\n'
+    { sni_cat big-tech; sni_cat cdn; sni_region_extra "$SNI_REGION"; } | tr ' ' '\n' | awk 'NF && !seen[$0]++'
   fi
 }
 sni_need_openssl() {
