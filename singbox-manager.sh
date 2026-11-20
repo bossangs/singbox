@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.7"
+SCRIPT_VERSION="2026.11.20.8"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -3768,6 +3768,62 @@ cmd_sni() {
   echo
   print_link "$node"
 }
+cmd_rename() {
+  # 修改已有节点名称（自定义名称；同步更新 sing-box 配置、凭据文件与分享链接后缀）
+  local old="${1:-}" new="${2:-}" node proto port tmp
+  if [[ -z "$old" ]]; then
+    echo "当前节点："
+    local f any=0
+    shopt -s nullglob
+    for f in "$DATA"/*.json; do
+      jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 || continue
+      printf '  %-24s %-20s 端口 %s\n' "$(jq -r .tag "$f")" "$(jq -r .protocol "$f")" "$(jq -r .port "$f")"
+      any=1
+    done
+    shopt -u nullglob
+    (( any )) || die "还没有节点"
+    echo
+    prompt old "要改名的节点名称" ""
+  fi
+  [[ -n "$old" ]] || die "原节点名称不能为空"
+  valid_tag "$old"
+  node="$DATA/$old.json"
+  [[ -f "$node" ]] || die "没有名为 $old 的节点"
+  proto="$(jq -r '.protocol // empty' "$node")"
+  [[ "$proto" != *Argo* ]] || die "$old 是 Argo 节点（绑定了隧道服务名 cloudflared-$old），如需换名建议重建或直接修改客户端里的备注。"
+  if [[ -z "$new" ]]; then
+    prompt new "新的节点名称（仅允许字母、数字、下划线和短横线）" ""
+  fi
+  [[ -n "$new" ]] || die "新节点名称不能为空"
+  valid_tag "$new"
+  if [[ "$new" == "$old" ]]; then
+    echo "节点名称没有变化：$new"
+    print_link "$node"
+    return 0
+  fi
+  tag_exists "$new" && die "节点名称 $new 已存在，请换一个"
+  port="$(jq -r '.port' "$node")"
+  EXPECT_PORT="$port"
+  EXPECT_NET="$(inbound_net "$old")"
+  commit_jq --arg old "$old" --arg new "$new" '
+    .inbounds |= map(if .tag == $old then .tag = $new else . end)
+    | .outbounds |= (if . then map(if .tag == ("to-" + $old) then .tag = ("to-" + $new) else . end) else . end)
+    | .route.rules |= (if . then map(
+        (if (.inbound? | type) == "array" then .inbound |= map(if . == $old then $new else . end) else . end)
+        | (if .outbound? == ("to-" + $old) then .outbound = ("to-" + $new) else . end)
+      ) else . end)'
+  tmp="$DATA/$new.json.tmp"
+  jq --arg new "$new" '.tag = $new' "$node" >"$tmp" && install -m 600 "$tmp" "$DATA/$new.json"
+  rm -f "$tmp" "$node"
+  if [[ -f "$RELAY_DIR/$old.json" ]]; then
+    tmp="$RELAY_DIR/$new.json.tmp"
+    jq --arg new "$new" '.tag = $new' "$RELAY_DIR/$old.json" >"$tmp" && install -m 600 "$tmp" "$RELAY_DIR/$new.json"
+    rm -f "$tmp" "$RELAY_DIR/$old.json"
+  fi
+  echo "已把节点 $old 改名为：$new（端口、UUID、密钥、SNI 不变）。"
+  echo
+  print_link "$DATA/$new.json"
+}
 
 # ---------- 修改节点端口 ----------
 inbound_net() {
@@ -4980,8 +5036,9 @@ menu() {
     echo "30) Telegram 机器人（配置 / 测试 / 推送 / 启停 / 日志）"
     echo "31) 推送节点分享链接到 Telegram（全部或单个）"
     echo "32) 修改 Reality 节点 SNI（握手域名）"
+    echo "33) 修改节点名称（自定义别名）"
     echo "0) 退出"
-    read -r -p "选择 [0-32]: " choice || exit 0
+    read -r -p "选择 [0-33]: " choice || exit 0
     case "$choice" in
       1) add_single_inbound ;;
       2) add_hy2 ;;
@@ -5015,6 +5072,7 @@ menu() {
       30) tg_menu ;;
       31) tg_push ;;
       32) cmd_sni ;;
+      33) cmd_rename ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -5104,6 +5162,7 @@ TXT
     scan-sni|sni-scan|scan) cmd_scan_sni ;;
     sni) if [[ -n "${2:-}" && "${2:-}" != --* ]]; then prepare_manage; cmd_sni "${2:-}" "${3:-}"; else cmd_scan_sni; fi ;;
     set-sni|change-sni) prepare_manage; cmd_sni "${2:-}" "${3:-}" ;;
+    rename) prepare_manage; cmd_rename "${2:-}" "${3:-}" ;;
     relay)
       prepare_manage
       case "${2:-menu}" in
