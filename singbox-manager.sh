@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.13"
+SCRIPT_VERSION="2026.11.20.14"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -5023,7 +5023,6 @@ menu() {
     echo "22) 启用 TCP BBR 与内核网络优化（直接写入 /etc/sysctl.d/99-custom.conf）"
     echo "23) 查看管理脚本/节点数据/备份/日志占用"
     echo "24) 节点服务保活/看门狗（启用/状态/检查/停用）"
-    echo "25) 查看 sing-box 入/出累计流量"
     echo "26) 添加 VMess AEAD（TCP；alterId=0）"
     echo "27) 添加 Trojan（TLS + 密码）"
     echo "28) 添加 Argo 节点（Cloudflare Tunnel + VMess/VLESS WS）"
@@ -5059,7 +5058,6 @@ menu() {
       22) cmd_bbr_apply ;;
       23) cmd_storage ;;
       24) watchdog_menu ;;
-      25) cmd_traffic show ;;
       26) add_vmess ;;
       27) add_trojan ;;
       28) add_argo ;;
