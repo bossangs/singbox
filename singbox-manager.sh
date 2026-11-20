@@ -1627,7 +1627,7 @@ print_link() {
       vmess_json="$(jq -nc --arg tag "$(jq -r '.tag' "$f")" --arg host "$(jq -r '.server' "$f")" \
         --arg port "$(jq -r '.port' "$f")" --arg uuid "$(jq -r '.uuid' "$f")" \
         '{v:"2",ps:$tag,add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"",sni:""}')"
-      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w0)"
+      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 | tr -d '\r\n')"
       ;;
     "VLESS + Reality")
       if (( $(jq '(.fps // [.fp // "chrome"]) | length' "$f") > 1 )); then
@@ -1698,7 +1698,7 @@ print_link() {
       vmess_json="$(jq -nc --arg tag "$(jq -r '.tag' "$f")" --arg host "$(jq -r '.server' "$f")" \
         --arg path "$(jq -r '.path' "$f")" --arg ws "$(jq -r '.ws_host // .server' "$f")" --arg uuid "$(jq -r '.uuid' "$f")" \
         '{v:"2",ps:$tag,add:$host,port:"443",id:$uuid,aid:"0",scy:"auto",net:"ws",type:"none",host:$ws,path:$path,tls:"tls",sni:$ws}')"
-      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w0)"
+      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 | tr -d '\r\n')"
       ;;
     "VLESS + WS (Argo)")
       local ahost apath atag
@@ -1710,7 +1710,7 @@ print_link() {
         "$(urlencode "$(jq -r '.uuid' "$f")")" "$h" "$ahost" "$apath" "$ahost" "$atag"
       ;;
     Shadowsocks)
-      userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 -w0)"
+      userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 | tr -d '\r\n')"
       echo "分享链接："
       jq -r --arg h "$h" --arg u "$userinfo" '"ss://\($u)@\($h):\(.port)#\(.tag)"' "$f" ;;
     "Telegram SOCKS5")
@@ -2712,6 +2712,7 @@ tg_collect_links() {
   shopt -u nullglob
   (( ${#files[@]} )) || { echo "还没有节点。"; return 0; }
   for f in "${files[@]}"; do
+    jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 || continue
     out="$(print_link "$f" | grep -E '^(vless|vmess|hysteria2|hy2|tuic|anytls|ss|trojan)://' || true)"
     [[ -n "$out" ]] || continue
     found=1
@@ -3277,7 +3278,7 @@ parse_share_link() {
     # 旧格式 ss://base64(method:password@host:port)
     dec="$(b64d "${rest%/}")"
     [[ "$dec" == *@* ]] || die "无法解析 ss 链接"
-    L_UI="$(printf '%s' "${dec%@*}" | base64 -w0)"
+    L_UI="$(printf '%s' "${dec%@*}" | base64 | tr -d '\r\n')"
     rest="${L_UI}@${dec##*@}"
   fi
   [[ "$rest" == *@* ]] || die "链接里缺少 用户信息@地址:端口"
@@ -3403,12 +3404,12 @@ manual_landing() {
     4) prompt a "密码" ""; prompt b "SNI（可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
        link="anytls://$(urlencode "$a")@${h}:${p}/?sni=$(urlencode "$b")&insecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
     5) prompt b "加密方式" "aes-128-gcm"; prompt a "密码" ""
-       link="ss://$(printf '%s:%s' "$b" "$a" | base64 -w0)@${h}:${p}" ;;
+       link="ss://$(printf '%s:%s' "$b" "$a" | base64 | tr -d '\r\n')@${h}:${p}" ;;
     6) prompt a "VMess UUID" ""
        vmess_host="${h#[}"; vmess_host="${vmess_host%]}"
        vmess_json="$(jq -nc --arg host "$vmess_host" --arg port "$p" --arg uuid "$a" \
          '{v:"2",ps:"relay",add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"tcp",type:"none",host:"",path:"",tls:"",sni:""}')"
-       link="vmess://$(printf '%s' "$vmess_json" | base64 -w0)" ;;
+       link="vmess://$(printf '%s' "$vmess_json" | base64 | tr -d '\r\n')" ;;
     7) prompt a "密码"; prompt b "SNI（证书域名，可留空）" " "; prompt d "允许不安全证书（自签证书选 y）[y/n]" "y"; b="${b// /}"
        link="trojan://$(urlencode "$a")@${h}:${p}?security=tls&sni=$(urlencode "$b")&type=tcp&allowInsecure=$([[ "$d" == [yY]* ]] && echo 1 || echo 0)" ;;
     8) prompt a "VMess UUID"; prompt b "SNI / Host（Argo 或 CDN 域名）"; prompt e "WebSocket path" "/"
@@ -3416,7 +3417,7 @@ manual_landing() {
        [[ "$e" == /* ]] || die "WebSocket path 必须以 / 开头"
        vmess_json="$(jq -nc --arg host "$vmess_host" --arg port "$p" --arg uuid "$a" --arg hh "$b" --arg path "$e" \
          '{v:"2",ps:"relay",add:$host,port:$port,id:$uuid,aid:"0",scy:"auto",net:"ws",type:"none",host:$hh,path:$path,tls:"tls",sni:$hh}')"
-       link="vmess://$(printf '%s' "$vmess_json" | base64 -w0)" ;;
+       link="vmess://$(printf '%s' "$vmess_json" | base64 | tr -d '\r\n')" ;;
     *) die "无效选项" ;;
   esac
   parse_share_link "$link"
@@ -3524,7 +3525,7 @@ print_forward_link() {
     # VMess 是 Base64(JSON)，直接重建 JSON 才能把地址和端口换成本机
     echo "分享链接（VMess，地址和端口已换成本机）："
     json="$(jq -r '.link.vmess_json' "$f" | jq -c --arg h "$(uri_host "$h")" --arg p "$port" '.add = $h | .port = $p')"
-    printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 -w0)"
+    printf 'vmess://%s\n' "$(printf '%s' "$json" | base64 | tr -d '\r\n')"
     return 0
   fi
   echo "分享链接（落地节点链接，地址已换成本机）："
@@ -4162,6 +4163,7 @@ show_links() {
   fi
   host="$(public_host)"
   for f in "${files[@]}"; do
+    jq -e '.protocol and .tag' "$f" >/dev/null 2>&1 || continue
     # Argo 节点的连接地址是 Cloudflare 域名，不能改成本机公网地址
     if [[ "$(jq -r '.protocol // empty' "$f")" != *Argo* ]] && [[ "$(jq -r '.server // empty' "$f")" != "$host" ]]; then
       jq --arg h "$host" '.server = $h' "$f" >"$f.tmp" && install -m 600 "$f.tmp" "$f"
