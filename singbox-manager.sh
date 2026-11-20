@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.4"
+SCRIPT_VERSION="2026.11.20.5"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1609,7 +1609,7 @@ telegram_auto_tag() {
 ask_tag() {
   # $1：变量名；$2：默认前缀
   local __t
-  prompt __t "节点名称" "$(next_tag "${TAG_PREFIX}$2")"
+  ask_value __t "节点名称" "$(next_tag "${TAG_PREFIX}$2")" tag name
   valid_tag "$__t"
   tag_exists "$__t" && die "节点名称 $__t 已存在，请换一个"
   printf -v "$1" '%s' "$__t"
