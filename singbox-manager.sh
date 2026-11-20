@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.8"
+SCRIPT_VERSION="2026.11.20.9"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -158,7 +158,11 @@ random_hex() { openssl rand -hex "${1:-8}"; }
 new_uuid() { "$SB" generate uuid; }
 prompt() { local __var="$1" __label="$2" __default="${3:-}"; local __v; if [[ -n "$__default" ]]; then read -r -p "$__label [$__default]: " __v; __v="${__v:-$__default}"; else read -r -p "$__label: " __v; fi; printf -v "$__var" '%s' "$__v"; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
-valid_tag() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "节点名称仅允许字母、数字、下划线和短横线，最长 40 字符"; }
+valid_tag() {
+  local t="$1"
+  [[ -n "$t" && ${#t} -le 60 && "$t" != .* && "$t" != -* && ! "$t" =~ [/\\[:space:][:cntrl:]] ]] ||
+    die "节点名称不能为空，不能包含斜杠、空格或控制字符，也不能以 . 或 - 开头（最长 60 字符）"
+}
 
 # ---------- 非交互参数 ----------
 # 菜单和原有子命令的用法完全不变；这里只是让同一套添加流程也能用 --选项 直接跑完。
@@ -1637,7 +1641,7 @@ print_link() {
         echo "分享链接（标准 VLESS Reality URI）："
       fi
       jq -r --arg h "$h" '(.fps // [.fp // "chrome"]) as $fps | $fps[] as $fp
-        | "vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=\($fp)&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
+        | "vless://\(.uuid)@\($h):\(.port)?encryption=none&security=reality&sni=\(.sni)&fp=\($fp)&pbk=\(.public_key)&sid=\(.short_id)&type=tcp&flow=xtls-rprx-vision#\(.tag|@uri)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f" ;;
     "VLESS + TLS (Xray)")
       local uuid qname qhost qpath qservice qfp typ
       uuid="$(urlencode "$(jq -r '.uuid' "$f")")"
@@ -1662,36 +1666,36 @@ print_link() {
     Hysteria2)
       if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
         echo "分享链接（使用受信任证书）："
-        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)#\(.tag|@uri)"' "$f"
       else
         echo "分享链接（自签证书，客户端需允许不安全证书）："
-        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"hysteria2://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)#\(.tag|@uri)"' "$f"
       fi ;;
     TUIC)
       if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
         echo "分享链接（使用受信任证书）："
-        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&sni=\(.sni)#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&sni=\(.sni)#\(.tag|@uri)"' "$f"
       else
         echo "分享链接（自签证书，客户端需允许不安全证书）："
-        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=\(.sni)#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"tuic://\(.uuid):\(.password|@uri)@\($h):\(.port)?congestion_control=bbr&alpn=h3&allow_insecure=1&sni=\(.sni)#\(.tag|@uri)"' "$f"
       fi ;;
     AnyTLS)
       if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
         echo "分享链接（使用受信任证书；不同客户端 URI 参数可能不同，请核对客户端文档）："
         jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
-          | "anytls://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
+          | "anytls://\(.password|@uri)@\($h):\(.port)/?sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag|@uri)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
       else
         echo "分享链接（自签证书，客户端需允许不安全证书；不同客户端 URI 参数可能不同，请核对客户端文档）："
         jq -r --arg h "$h" '(.fps // (if .fp then [.fp] else [""] end)) as $fps | $fps[] as $fp
-          | "anytls://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
+          | "anytls://\(.password|@uri)@\($h):\(.port)/?insecure=1&sni=\(.sni)\(if $fp != "" then "&fp=" + $fp else "" end)#\(.tag|@uri)\(if ($fps | length) > 1 then "-" + $fp else "" end)"' "$f"
       fi ;;
     Trojan)
       if [[ "$(jq -r 'if .insecure == false then "0" else "1" end' "$f")" == 0 ]]; then
         echo "分享链接（Trojan over TLS，使用受信任证书）："
-        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp#\(.tag|@uri)"' "$f"
       else
         echo "分享链接（自签证书，客户端需允许不安全证书）："
-        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp&allowInsecure=1#\(.tag)"' "$f"
+        jq -r --arg h "$h" '"trojan://\(.password|@uri)@\($h):\(.port)?security=tls&sni=\(.sni)&type=tcp&allowInsecure=1#\(.tag|@uri)"' "$f"
       fi ;;
     "VMess + WS (Argo)")
       local vmess_json
@@ -1713,7 +1717,7 @@ print_link() {
     Shadowsocks)
       userinfo="$(jq -j '"\(.method):\(.password)"' "$f" | base64 | tr -d '\r\n')"
       echo "分享链接："
-      jq -r --arg h "$h" --arg u "$userinfo" '"ss://\($u)@\($h):\(.port)#\(.tag)"' "$f" ;;
+      jq -r --arg h "$h" --arg u "$userinfo" '"ss://\($u)@\($h):\(.port)#\(.tag|@uri)"' "$f" ;;
     "Telegram SOCKS5")
       encoded_server="$(urlencode "$(jq -r '.server' "$f")")"
       port="$(jq -r '.port' "$f")"
