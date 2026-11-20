@@ -1997,7 +1997,7 @@ sni_scan() {
   fi
   printf '%-32s %-6s %-8s %-6s %-6s %-4s %s\n' "域名" "结果" "延迟" "TLS13" "X25519" "H2" "证书"
   local -a ordered=()
-  ordered=("${sorted[@]}" "${failed[@]}")
+  ordered=("${sorted[@]+"${sorted[@]}"}" "${failed[@]+"${failed[@]}"}")
   for line in "${ordered[@]}"; do
     [[ -n "$line" ]] || continue
     IFS=$'\t' read -r -a cols <<<"$line"
@@ -2062,7 +2062,9 @@ sni_collect() {
 }
 sni_need_openssl() {
   have openssl || die "缺少 openssl，无法验证 TLS。先运行：$(self_cmd) install"
-  openssl s_client -help 2>&1 | grep -q -- '-groups' || die "当前 openssl 不支持 -groups，无法检查 X25519；请升级 openssl（OpenSSL 1.1.1 及以上）"
+  local help_out
+  help_out="$(openssl s_client -help 2>&1 || true)"
+  [[ "$help_out" == *"-groups"* ]] || die "当前 openssl 不支持 -groups，无法检查 X25519；请升级 openssl（OpenSSL 1.1.1 及以上）"
 }
 sni_run() {
   # 先收集候选，再在当前 shell 里扫描（避免管道子 shell 丢掉 SNI_ROWS / SNI_BEST）
@@ -2111,6 +2113,7 @@ sni_interactive() {
   echo "3) 按分类扫描（big-tech / cdn / dev / media / ecom）"
   echo "4) 自定义域名列表扫描（逗号分隔或文件路径）"
   read -r -p "选择 [1-4，默认 1]: " c || c=1
+  OPTS[category]=""; OPTS[file]=""; OPTS[list]=""
   case "${c:-1}" in
     1)
       prompt d "Reality SNI/握手域名" "www.bing.com"
@@ -2128,7 +2131,7 @@ sni_interactive() {
       if [[ -f "$l" ]]; then OPTS[file]="$l"; else OPTS[list]="$l"; fi ;;
   esac
   sni_need_openssl
-  sni_run
+  sni_run || true
   sni_save_cache
   sni_select "$__var"
 }
