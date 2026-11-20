@@ -11,8 +11,9 @@
 
 set -Eeuo pipefail
 umask 077
+trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.3"
+SCRIPT_VERSION="2026.11.20.4"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -94,7 +95,7 @@ SNI_CACHE="$DATA/sni-scan.json"
 SNI_BEST=""
 SNI_REGION=""
 
-die() { echo "错误：$*" >&2; exit 1; }
+die() { trap - ERR; echo "错误：$*" >&2; exit 1; }
 need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请使用 root 运行：sudo -i"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 is_supported_install_os() {
