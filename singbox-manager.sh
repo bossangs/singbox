@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.11"
+SCRIPT_VERSION="2026.11.20.12"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1773,6 +1773,7 @@ save_node() {
   LAST_TAG="$1"
   jq . "$f"
   print_link "$f"
+  echo
   tg_maybe_autopush "$1" || true
 }
 
