@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2026.11.20.1"
+SCRIPT_VERSION="2026.11.20.2"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -1814,12 +1814,32 @@ show_fp_choices() {
 }
 choose_fps() {
   # $1：变量名（结果为空格分隔的指纹列表）；$2：默认值；$3=reality 时排除 Reality 用不了的指纹
-  local __v __r __def="${2:-chrome}"
+  local __v __r="" __def="${2:-chrome}" __mode="${3:-}"
+  __v="$(optv fps fp)"
+  if [[ -n "$__v" ]]; then
+    __r="$(parse_fps "$__v" "$__mode")" || die "指纹选择无效"
+    printf -v "$1" '%s' "$__r"
+    echo "已选择指纹：$__r"
+    return 0
+  fi
+  if (( ${NONINT:-0} )); then
+    __r="$(parse_fps "$__def" "$__mode")" || die "默认指纹无效"
+    printf -v "$1" '%s' "$__r"
+    echo "已选择指纹：$__r"
+    return 0
+  fi
   echo "客户端 TLS 指纹（uTLS fp）："
-  show_fp_choices "${3:-}"
-  read -r -p "选择 [默认 $__def]: " __v || __v=""
-  [[ -n "${__v//[[:space:]]/}" ]] || __v="$__def"
-  __r="$(parse_fps "$__v" "${3:-}")" || die "指纹选择无效"
+  show_fp_choices "$__mode"
+  while true; do
+    if ! read -r -p "选择 [默认 $__def]: " __v; then
+      __v="$__def"
+    fi
+    [[ -n "${__v//[[:space:]]/}" ]] || __v="$__def"
+    if __r="$(parse_fps "$__v" "$__mode")"; then
+      break
+    fi
+    echo "指纹选择无效，请重新输入（直接回车使用默认 $__def）。" >&2
+  done
   printf -v "$1" '%s' "$__r"
   echo "已选择指纹：$__r"
 }
