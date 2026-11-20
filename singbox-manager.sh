@@ -13,7 +13,7 @@ set -Eeuo pipefail
 umask 077
 trap 'echo "脚本异常退出（第 ${LINENO} 行：${BASH_COMMAND}，退出码 $?）" >&2' ERR
 
-SCRIPT_VERSION="2026.11.20.5"
+SCRIPT_VERSION="2026.11.20.6"
 MARK="# @bossangs-singbox-manager"
 XRAY_MARK="# @bossangs-singbox-xray"
 XRAY_USER="singbox-xray"
@@ -3716,6 +3716,57 @@ cmd_fp() {
   echo
   print_link "$node"
 }
+cmd_sni() {
+  # 修改已有 VLESS + Reality 节点的 SNI / 握手域名（不动 UUID、密钥和端口）
+  local tag="${1:-}" new="${2:-}" node proto cur port tmp
+  if [[ -z "$tag" ]]; then
+    echo "当前 Reality 节点："
+    local f any=0
+    shopt -s nullglob
+    for f in "$DATA"/*.json; do
+      jq -e '.protocol == "VLESS + Reality" and .tag' "$f" >/dev/null 2>&1 || continue
+      printf '  %-24s 端口 %-6s SNI: %s\n' "$(jq -r .tag "$f")" "$(jq -r .port "$f")" "$(jq -r .sni "$f")"
+      any=1
+    done
+    shopt -u nullglob
+    (( any )) || die "还没有 VLESS + Reality 节点"
+    echo
+    prompt tag "要修改 SNI 的节点名称" ""
+  fi
+  [[ -n "$tag" ]] || die "名称不能为空"
+  valid_tag "$tag"
+  node="$DATA/$tag.json"
+  [[ -f "$node" ]] || die "没有名为 $tag 的节点"
+  proto="$(jq -r .protocol "$node")"
+  [[ "$proto" == "VLESS + Reality" ]] || die "$tag 是 ${proto}，只有 VLESS + Reality 节点支持修改握手 SNI"
+  cur="$(jq -r '.sni // empty' "$node")"
+  port="$(jq -r '.port' "$node")"
+  if [[ -z "$new" ]]; then
+    echo "节点 $tag 当前 SNI：$cur"
+    sni_interactive new
+  elif [[ "$new" == auto || "$new" == scan ]]; then
+    new="$(sni_auto_pick)"
+  fi
+  new="${new#"${new%%[![:space:]]*}"}"; new="${new%"${new##*[![:space:]]}"}"
+  new="${new#https://}"; new="${new#http://}"; new="${new%%/*}"; new="${new%%:*}"
+  [[ -n "$new" ]] || die "SNI 不能为空"
+  valid_domain "$new" || die "SNI 必须是域名（不要带 https:// 或路径）：$new"
+  if [[ "$new" == "$cur" ]]; then
+    echo "SNI 没有变化：$new"
+    print_link "$node"
+    return 0
+  fi
+  EXPECT_PORT="$port"
+  EXPECT_NET="tcp"
+  commit_jq --arg tag "$tag" --arg sni "$new" '
+    .inbounds |= map(if .tag == $tag then .tls.server_name = $sni | .tls.reality.handshake.server = $sni else . end)'
+  tmp="$node.tmp"
+  jq --arg sni "$new" --arg h "$(public_host)" '.server = $h | .sni = $sni' "$node" >"$tmp" && install -m 600 "$tmp" "$node"
+  rm -f "$tmp"
+  echo "已把 $tag 的 SNI 从 $cur 改为：$new（UUID、密钥、端口不变）。"
+  echo
+  print_link "$node"
+}
 
 # ---------- 修改节点端口 ----------
 inbound_net() {
@@ -4927,8 +4978,9 @@ menu() {
     echo "29) Reality SNI 扫描（按地区/分类/自定义列表验证 TLS1.3、X25519、证书与 HTTP/2）"
     echo "30) Telegram 机器人（配置 / 测试 / 推送 / 启停 / 日志）"
     echo "31) 推送节点分享链接到 Telegram（全部或单个）"
+    echo "32) 修改 Reality 节点 SNI（握手域名）"
     echo "0) 退出"
-    read -r -p "选择 [0-31]: " choice || exit 0
+    read -r -p "选择 [0-32]: " choice || exit 0
     case "$choice" in
       1) add_single_inbound ;;
       2) add_hy2 ;;
@@ -4961,6 +5013,7 @@ menu() {
       29) cmd_scan_sni ;;
       30) tg_menu ;;
       31) tg_push ;;
+      32) cmd_sni ;;
       0) exit 0 ;;
       *) echo "无效选项" ;;
     esac
@@ -5047,7 +5100,9 @@ TXT
         *) die "未知协议：${2}（可用：reality、hy2、tuic、anytls、trojan、ss、vmess、argo、tg、xray）" ;;
       esac ;;
     argo) cmd_argo "${2:-add}" "${3:-}" "${4:-}" ;;
-    scan-sni|sni-scan|sni|scan) cmd_scan_sni ;;
+    scan-sni|sni-scan|scan) cmd_scan_sni ;;
+    sni) if [[ -n "${2:-}" && "${2:-}" != --* ]]; then prepare_manage; cmd_sni "${2:-}" "${3:-}"; else cmd_scan_sni; fi ;;
+    set-sni|change-sni) prepare_manage; cmd_sni "${2:-}" "${3:-}" ;;
     relay)
       prepare_manage
       case "${2:-menu}" in
