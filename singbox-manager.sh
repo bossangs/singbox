@@ -2072,38 +2072,39 @@ sni_run() {
   sni_scan <<<"$cands"
 }
 sni_select() {
-  # 从 SNI_ROWS 里选一个候选（回车用最快的）；结果输出到 stdout
-  local line d ans i=0
+  # 从 SNI_ROWS 里选一个候选（回车用最快的）；$1 若为变量名则写入该变量，否则输出到 stdout
+  local __var="${1:-}" line d ans i=0
   local -a pass=()
   for line in "${SNI_ROWS[@]+"${SNI_ROWS[@]}"}"; do
     [[ "$(cut -f2 <<<"$line")" == PASS ]] && pass+=("$line")
   done
   if (( ${#pass[@]} == 0 )); then
     prompt d "手动输入 Reality SNI（直接回车用 www.bing.com）" "www.bing.com"
-    printf '%s' "$d"; return 0
-  fi
-  echo
-  for line in "${pass[@]}"; do
-    i=$((i + 1))
-    printf '  %d) %-32s %sms\n' "$i" "${line%%$'\t'*}" "$(cut -f3 <<<"$line")"
-  done
-  read -r -p "选择序号（回车用 1，也可直接输入域名）: " ans || ans=""
-  ans="${ans//[[:space:]]/}"
-  if [[ -z "$ans" ]]; then
-    d="${pass[0]%%$'\t'*}"
-  elif [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= ${#pass[@]} )); then
-    d="${pass[$((10#$ans - 1))]%%$'\t'*}"
-  elif valid_domain "$ans"; then
-    d="$ans"
   else
-    d="${pass[0]%%$'\t'*}"
-    echo "编号无效，使用最快的 $d" >&2
+    echo
+    for line in "${pass[@]}"; do
+      i=$((i + 1))
+      printf '  %d) %-32s %sms\n' "$i" "${line%%$'\t'*}" "$(cut -f3 <<<"$line")"
+    done
+    read -r -p "选择序号（回车用 1，也可直接输入域名）: " ans || ans=""
+    ans="${ans//[[:space:]]/}"
+    if [[ -z "$ans" ]]; then
+      d="${pass[0]%%$'\t'*}"
+    elif [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= ${#pass[@]} )); then
+      d="${pass[$((10#$ans - 1))]%%$'\t'*}"
+    elif valid_domain "$ans"; then
+      d="$ans"
+    else
+      d="${pass[0]%%$'\t'*}"
+      echo "编号无效，使用最快的 $d" >&2
+    fi
   fi
-  printf '%s' "$d"
+  if [[ -n "$__var" ]]; then printf -v "$__var" '%s' "$d"; else printf '%s' "$d"; fi
 }
 sni_interactive() {
   # 添加 Reality 时选择 SNI：手动输入，或按地区 / 分类 / 自定义列表扫描后挑一个
-  local c cat l
+  # $1：目标变量名（写入选中的域名，避免在命令替换 $() 中误捕获菜单输出）
+  local __var="${1:-}" c cat l d=""
   echo "Reality SNI / 握手域名（伪装目标，需要支持 TLS 1.3 + X25519 + HTTP/2 的有效证书）："
   echo "1) 手动输入（默认 www.bing.com）"
   echo "2) 按本机出口地区自动扫描"
@@ -2111,7 +2112,10 @@ sni_interactive() {
   echo "4) 自定义域名列表扫描（逗号分隔或文件路径）"
   read -r -p "选择 [1-4，默认 1]: " c || c=1
   case "${c:-1}" in
-    1) local d; prompt d "Reality SNI/握手域名" "www.bing.com"; printf '%s' "$d"; return 0 ;;
+    1)
+      prompt d "Reality SNI/握手域名" "www.bing.com"
+      if [[ -n "$__var" ]]; then printf -v "$__var" '%s' "$d"; else printf '%s' "$d"; fi
+      return 0 ;;
     3)
       echo "分类：1) big-tech 2) cdn 3) dev 4) media 5) ecom 6) all"
       read -r -p "选择 [1-6，默认 1]: " cat || cat=1
@@ -2126,7 +2130,7 @@ sni_interactive() {
   sni_need_openssl
   sni_run
   sni_save_cache
-  sni_select
+  sni_select "$__var"
 }
 sni_auto_pick() {
   # 非交互：扫描后自动返回最快的可用域名；表格输出到 stderr，便于调用方取返回值
@@ -2163,10 +2167,12 @@ add_reality() {
   ask_port port "TCP 端口" "$(free_port 443 tcp)" tcp
   sni="$(optv sni)"
   if [[ -z "$sni" ]]; then
-    if (( NONINT )); then sni="www.bing.com"; else sni="$(sni_interactive)"; fi
+    if (( NONINT )); then sni="www.bing.com"; else sni_interactive sni; fi
   elif [[ "$sni" == auto || "$sni" == scan ]]; then
     sni="$(sni_auto_pick)"
   fi
+  sni="${sni#"${sni%%[![:space:]]*}"}"; sni="${sni%"${sni##*[![:space:]]}"}"
+  sni="${sni#https://}"; sni="${sni#http://}"; sni="${sni%%/*}"; sni="${sni%%:*}"
   [[ -n "$sni" ]] || die "Reality SNI 不能为空"
   valid_domain "$sni" || die "Reality SNI 必须是域名（不要带 https:// 或路径）：$sni"
   choose_fps fps chrome reality
